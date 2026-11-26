@@ -2,19 +2,19 @@
 
 //! Quick spike tool to inspect real emails in a Stalwart JMAP mailbox.
 //!
-//! Usage:
-//!   VELA_SERVER_URL=https://yogg... VELA_USERNAME=... VELA_PASSWORD=... \
-//!     cargo run -p vela-jmap --example inspect_mailbox
+//! Uses credentials stored in `~/.config/vela/config.toml` + OS Keyring
+//! (sign in once via `just run`).
 
 use vela_core::MailboxRole;
 use vela_flows::html;
-use vela_jmap::{JmapConfig, JmapSession};
+use vela_jmap::{JmapSession, store};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let Some(config) = JmapConfig::from_env()? else {
+    let Some(config) = store::load_saved_jmap_config().await? else {
         eprintln!(
-            "Set VELA_SERVER_URL and VELA_TOKEN (or VELA_USERNAME + VELA_PASSWORD) to inspect a live mailbox."
+            "No saved account found in ~/.config/vela/config.toml + OS Keyring.\n\
+             Run `just run` and sign in once first."
         );
         std::process::exit(1);
     };

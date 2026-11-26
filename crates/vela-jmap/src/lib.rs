@@ -6,6 +6,8 @@
 //! thread listing, and conversation loading each complete in a single HTTP
 //! roundtrip.
 
+pub mod store;
+
 use std::collections::HashMap;
 use std::fmt;
 

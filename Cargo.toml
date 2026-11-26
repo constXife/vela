@@ -15,14 +15,17 @@ publish = false
 
 [workspace.dependencies]
 ammonia = "4"
+dirs = "6"
 jiff = { version = "0.2", features = ["serde"] }
 jmap-client = { version = "0.3", default-features = false, features = ["async", "websockets"] }
+oo7 = { version = "0.4", default-features = false, features = ["tokio", "native_crypto"] }
 # Enable OS trust store roots in reqwest so private CAs (e.g. ca.example.com)
 # work with full TLS verification inside jmap-client.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots"] }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 zeroize = { version = "1", features = ["derive"] }

@@ -4,6 +4,8 @@
 //!
 //! Keeps all state transitions in `vela-flows` and runs all JMAP network I/O
 //! asynchronously off the UI thread so scrolling and keyboard triage stay smooth.
+//! Credentials are stored in the OS Keyring (`org.freedesktop.secrets`) with
+//! non-secret account metadata in `~/.config/vela/config.toml` (`0600`).
 
 mod sample;
 
@@ -11,18 +13,20 @@ use std::sync::Arc;
 
 use cosmic::app::{Core, Settings, Task};
 use cosmic::iced::core::layout::Limits;
-use cosmic::iced::{Event, Length, Size, Subscription, event, keyboard};
+use cosmic::iced::{Alignment, Event, Length, Size, Subscription, event, keyboard};
 use cosmic::{Element, executor, widget};
 use vela_core::{
     Mailbox, MailboxId, Message as MailMessage, MessageId, RemoteImagePolicy, ThreadId,
     ThreadSummary,
 };
 use vela_flows::{InboxEffect, InboxEvent, InboxState, TriageAction, html};
-use vela_jmap::{JmapConfig, JmapSession, ThreadMutation};
+use vela_jmap::{JmapConfig, JmapCredentials, JmapSession, ThreadMutation, store};
+use zeroize::Zeroize;
 
 const WINDOW_SIZE: Size = Size::new(1280.0, 760.0);
 const WINDOW_MIN: Size = Size::new(960.0, 600.0);
 const INITIAL_THREAD_LIMIT: usize = 50;
+const DEFAULT_SERVER_URL: &str = "https://mail.example.com";
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
@@ -49,15 +53,60 @@ impl cosmic::app::CosmicFlags for Flags {
     type Args = Vec<String>;
 }
 
+enum Screen {
+    Starting,
+    Connect(ConnectForm),
+    Inbox,
+}
+
+struct ConnectForm {
+    server_url: String,
+    username: String,
+    password: String,
+    connecting: bool,
+    error: Option<String>,
+}
+
+impl ConnectForm {
+    fn from_saved_or_default() -> Self {
+        let saved = store::load_account_config().ok().flatten();
+        Self {
+            server_url: saved
+                .as_ref()
+                .map(|c| c.server_url.clone())
+                .unwrap_or_else(|| DEFAULT_SERVER_URL.to_string()),
+            username: saved.map(|c| c.username).unwrap_or_default(),
+            password: String::new(),
+            connecting: false,
+            error: None,
+        }
+    }
+
+    fn wipe_password(&mut self) {
+        self.password.zeroize();
+    }
+}
+
 struct App {
     core: Core,
+    screen: Screen,
     inbox: InboxState,
     session: Option<Arc<JmapSession>>,
 }
 
+type ConnectedAccount = (Arc<JmapSession>, Vec<Mailbox>);
+
 #[derive(Clone, Debug)]
 enum Message {
-    Connected(Result<(Arc<JmapSession>, Vec<Mailbox>), String>),
+    StartupResolved(Result<Option<ConnectedAccount>, String>),
+    ServerUrlChanged(String),
+    UsernameChanged(String),
+    PasswordChanged(String),
+    SubmitConnect,
+    ConnectFinished(Result<ConnectedAccount, String>),
+    OpenSampleMode,
+    SignOut,
+    SignedOut,
     SelectMailbox(MailboxId),
     ThreadsLoaded {
         op_id: vela_flows::OpId,
@@ -201,41 +250,35 @@ impl cosmic::Application for App {
     }
 
     fn init(core: Core, _flags: Self::Flags) -> (Self, Task<Self::Message>) {
-        let mut app = Self {
+        let app = Self {
             core,
+            screen: Screen::Starting,
             inbox: InboxState::new(),
             session: None,
         };
 
-        match JmapConfig::from_env() {
-            Ok(Some(config)) => {
-                app.inbox.status_banner = Some(format!("Connecting to {}…", config.server_url));
-                let task = cosmic::task::future(async move {
-                    let result = async {
-                        let session = Arc::new(JmapSession::connect(&config).await?);
-                        let mailboxes = session.list_mailboxes().await?;
-                        Ok::<_, vela_core::VelaError>((session, mailboxes))
-                    }
-                    .await
-                    .map_err(|e| e.to_string());
-                    Message::Connected(result)
-                });
-                (app, task)
+        let task = cosmic::task::future(async move {
+            let result = async {
+                let Some(config) = store::load_saved_jmap_config().await? else {
+                    return Ok(None);
+                };
+                let session = Arc::new(JmapSession::connect(&config).await?);
+                let mailboxes = session.list_mailboxes().await?;
+                Ok::<_, vela_core::VelaError>(Some((session, mailboxes)))
             }
-            Ok(None) => {
-                let task = app.dispatch(InboxEvent::MailboxesLoaded(sample::mailboxes()));
-                (app, task)
-            }
-            Err(err) => {
-                app.inbox.status_banner =
-                    Some(format!("Config error: {err} (showing sample data)"));
-                let task = app.dispatch(InboxEvent::MailboxesLoaded(sample::mailboxes()));
-                (app, task)
-            }
-        }
+            .await
+            .map_err(|e| e.to_string());
+            Message::StartupResolved(result)
+        });
+
+        (app, task)
     }
 
     fn subscription(&self) -> Subscription<Self::Message> {
+        if !matches!(self.screen, Screen::Inbox) {
+            return Subscription::none();
+        }
+
         event::listen_with(|ev, status, _window| {
             if matches!(status, event::Status::Captured) {
                 return None;
@@ -267,14 +310,109 @@ impl cosmic::Application for App {
 
     fn update(&mut self, message: Self::Message) -> Task<Self::Message> {
         match message {
-            Message::Connected(Ok((session, mailboxes))) => {
+            Message::StartupResolved(Ok(Some((session, mailboxes)))) => {
                 self.session = Some(session);
-                self.inbox.status_banner = None;
+                self.screen = Screen::Inbox;
                 self.dispatch(InboxEvent::MailboxesLoaded(mailboxes))
             }
-            Message::Connected(Err(err)) => self.dispatch(InboxEvent::ReportError(format!(
-                "JMAP connect failed: {err}"
-            ))),
+            Message::StartupResolved(Ok(None)) => {
+                self.screen = Screen::Connect(ConnectForm::from_saved_or_default());
+                Task::none()
+            }
+            Message::StartupResolved(Err(err)) => {
+                let mut form = ConnectForm::from_saved_or_default();
+                form.error = Some(err);
+                self.screen = Screen::Connect(form);
+                Task::none()
+            }
+            Message::ServerUrlChanged(val) => {
+                if let Screen::Connect(form) = &mut self.screen {
+                    form.server_url = val;
+                }
+                Task::none()
+            }
+            Message::UsernameChanged(val) => {
+                if let Screen::Connect(form) = &mut self.screen {
+                    form.username = val;
+                }
+                Task::none()
+            }
+            Message::PasswordChanged(val) => {
+                if let Screen::Connect(form) = &mut self.screen {
+                    form.password = val;
+                }
+                Task::none()
+            }
+            Message::SubmitConnect => {
+                let Screen::Connect(form) = &mut self.screen else {
+                    return Task::none();
+                };
+                if form.connecting {
+                    return Task::none();
+                }
+                let server_url = form.server_url.trim().to_string();
+                let username = form.username.trim().to_string();
+                let password = form.password.clone();
+                if server_url.is_empty() || username.is_empty() || password.is_empty() {
+                    form.error = Some("Enter server URL, username, and password.".into());
+                    return Task::none();
+                }
+                form.connecting = true;
+                form.error = None;
+
+                let config = JmapConfig {
+                    server_url,
+                    credentials: JmapCredentials::Basic { username, password },
+                };
+                cosmic::task::future(async move {
+                    let result = async {
+                        let session = Arc::new(JmapSession::connect(&config).await?);
+                        let mailboxes = session.list_mailboxes().await?;
+                        store::save_jmap_config(&config).await?;
+                        Ok::<_, vela_core::VelaError>((session, mailboxes))
+                    }
+                    .await
+                    .map_err(|e| e.to_string());
+                    Message::ConnectFinished(result)
+                })
+            }
+            Message::ConnectFinished(Ok((session, mailboxes))) => {
+                if let Screen::Connect(form) = &mut self.screen {
+                    form.wipe_password();
+                }
+                self.session = Some(session);
+                self.inbox = InboxState::new();
+                self.screen = Screen::Inbox;
+                self.dispatch(InboxEvent::MailboxesLoaded(mailboxes))
+            }
+            Message::ConnectFinished(Err(err)) => {
+                if let Screen::Connect(form) = &mut self.screen {
+                    form.connecting = false;
+                    form.error = Some(err);
+                }
+                Task::none()
+            }
+            Message::OpenSampleMode => {
+                if let Screen::Connect(form) = &mut self.screen {
+                    form.wipe_password();
+                }
+                self.session = None;
+                self.inbox = InboxState::new();
+                self.screen = Screen::Inbox;
+                self.dispatch(InboxEvent::MailboxesLoaded(sample::mailboxes()))
+            }
+            Message::SignOut => {
+                self.session = None;
+                self.inbox = InboxState::new();
+                cosmic::task::future(async move {
+                    let _ = store::clear_saved_secret().await;
+                    Message::SignedOut
+                })
+            }
+            Message::SignedOut => {
+                self.screen = Screen::Connect(ConnectForm::from_saved_or_default());
+                Task::none()
+            }
             Message::SelectMailbox(id) => self.dispatch(InboxEvent::SelectMailbox(id)),
             Message::ThreadsLoaded {
                 op_id,
@@ -315,6 +453,72 @@ impl cosmic::Application for App {
     }
 
     fn view(&self) -> Element<'_, Self::Message> {
+        match &self.screen {
+            Screen::Starting => widget::container(widget::text::body("Connecting to account…"))
+                .center(Length::Fill)
+                .into(),
+            Screen::Connect(form) => self.view_connect(form),
+            Screen::Inbox => self.view_inbox(),
+        }
+    }
+}
+
+impl App {
+    fn view_connect<'a>(&self, form: &'a ConnectForm) -> Element<'a, Message> {
+        let mut card = widget::column::with_capacity(8)
+            .spacing(12)
+            .push(widget::text::title2("Sign in to Vela"))
+            .push(widget::text::caption(
+                "Password is stored securely in the OS Keyring; only server URL and username are saved in ~/.config/vela/config.toml.",
+            ))
+            .push(
+                widget::text_input("Server URL (e.g. https://mail.example.com)", &form.server_url)
+                    .on_input(Message::ServerUrlChanged)
+                    .on_submit(|_| Message::SubmitConnect),
+            )
+            .push(
+                widget::text_input("Username or email", &form.username)
+                    .on_input(Message::UsernameChanged)
+                    .on_submit(|_| Message::SubmitConnect),
+            )
+            .push(
+                widget::text_input("Password", &form.password)
+                    .password()
+                    .on_input(Message::PasswordChanged)
+                    .on_submit(|_| Message::SubmitConnect),
+            );
+
+        if let Some(err) = &form.error {
+            card = card.push(widget::text::caption(format!("Error: {err}")));
+        }
+
+        let connect_label = if form.connecting {
+            "Connecting…"
+        } else {
+            "Connect"
+        };
+        let mut connect_btn = widget::button::suggested(connect_label);
+        if !form.connecting {
+            connect_btn = connect_btn.on_press(Message::SubmitConnect);
+        }
+
+        let actions = widget::row::with_capacity(2)
+            .push(connect_btn)
+            .push(widget::button::text("Preview sample data").on_press(Message::OpenSampleMode))
+            .spacing(12)
+            .align_y(Alignment::Center);
+
+        card = card.push(actions);
+
+        let boxed = widget::container(card)
+            .padding(24)
+            .width(Length::Fixed(440.0))
+            .class(cosmic::theme::Container::Card);
+
+        widget::container(boxed).center(Length::Fill).into()
+    }
+
+    fn view_inbox(&self) -> Element<'_, Message> {
         let mailboxes_col = self.view_mailboxes();
         let threads_col = self.view_threads();
         let conversation_col = self.view_conversation();
@@ -337,7 +541,7 @@ impl cosmic::Application for App {
             let mut row = widget::row::with_capacity(3)
                 .push(widget::text::body(banner))
                 .push(widget::space::horizontal())
-                .align_y(cosmic::iced::Alignment::Center)
+                .align_y(Alignment::Center)
                 .spacing(12);
             if self.inbox.last_undo.is_some() {
                 row = row.push(widget::button::text("Undo (Z)").on_press(Message::Undo));
@@ -350,11 +554,9 @@ impl cosmic::Application for App {
 
         root.into()
     }
-}
 
-impl App {
     fn view_mailboxes(&self) -> Element<'_, Message> {
-        let mut list = widget::column::with_capacity(self.inbox.mailboxes.len() + 1)
+        let mut list = widget::column::with_capacity(self.inbox.mailboxes.len() + 3)
             .spacing(4)
             .padding(12);
         list = list.push(widget::text::title4("Mailboxes"));
@@ -376,10 +578,26 @@ impl App {
             list = list.push(btn);
         }
 
-        widget::scrollable(list)
+        let footer_label = if self.session.is_some() {
+            "Sign out"
+        } else {
+            "Sign in…"
+        };
+        let sidebar = widget::column::with_capacity(3)
+            .push(widget::scrollable(list).height(Length::Fill))
+            .push(widget::divider::horizontal::default())
+            .push(
+                widget::container(
+                    widget::button::text(footer_label)
+                        .width(Length::Fill)
+                        .on_press(Message::SignOut),
+                )
+                .padding(8),
+            )
             .width(Length::Fixed(210.0))
-            .height(Length::Fill)
-            .into()
+            .height(Length::Fill);
+
+        sidebar.into()
     }
 
     fn view_threads(&self) -> Element<'_, Message> {
@@ -479,7 +697,7 @@ impl App {
                                         .on_press(Message::AllowRemoteImages(msg.id.clone())),
                                 )
                                 .spacing(8)
-                                .align_y(cosmic::iced::Alignment::Center),
+                                .align_y(Alignment::Center),
                         );
                     } else {
                         card = card.push(widget::text::caption(

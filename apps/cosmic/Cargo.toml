@@ -18,3 +18,4 @@ tracing-subscriber.workspace = true
 vela-core.workspace = true
 vela-flows.workspace = true
 vela-jmap.workspace = true
+zeroize.workspace = true

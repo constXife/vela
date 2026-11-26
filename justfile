@@ -1,5 +1,3 @@
-set dotenv-load
-
 # Run all fast headless tests (core + jmap + flows)
 test:
     cargo test --workspace
