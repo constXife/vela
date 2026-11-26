@@ -7,7 +7,9 @@
 //! mutations update the visible list optimistically so keyboard navigation stays
 //! instantaneous.
 
-use std::collections::HashMap;
+pub mod html;
+
+use std::collections::{HashMap, HashSet};
 
 use vela_core::{
     Mailbox, MailboxId, MailboxRole, Message, MessageId, RemoteImagePolicy, ThreadId, ThreadSummary,
@@ -41,8 +43,10 @@ pub struct InboxState {
     pub loading_threads: bool,
     pub loading_conversation: bool,
     pub remote_image_policies: HashMap<MessageId, RemoteImagePolicy>,
+    pub expanded_quotes: HashSet<MessageId>,
     pub last_undo: Option<UndoEntry>,
     pub status_banner: Option<String>,
+    conversation_cache: HashMap<ThreadId, Vec<Message>>,
     next_op: u64,
     active_mailbox_op: Option<OpId>,
     active_thread_op: Option<OpId>,
@@ -70,6 +74,8 @@ pub enum InboxEvent {
     ToggleSelectedRead,
     UndoLastTriage,
     AllowRemoteImages(MessageId),
+    ToggleQuote(MessageId),
+    ReportError(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -165,6 +171,12 @@ impl InboxState {
                     return Vec::new();
                 }
                 self.loading_conversation = false;
+                // Keep a bounded in-memory cache (64 threads) so hopping back
+                // and forth during triage is instantaneous.
+                if self.conversation_cache.len() >= 64 {
+                    self.conversation_cache.clear();
+                }
+                self.conversation_cache.insert(thread_id, messages.clone());
                 self.conversation = messages;
                 Vec::new()
             }
@@ -179,6 +191,18 @@ impl InboxState {
             InboxEvent::AllowRemoteImages(message_id) => {
                 self.remote_image_policies
                     .insert(message_id, RemoteImagePolicy::AllowOnce);
+                Vec::new()
+            }
+            InboxEvent::ToggleQuote(message_id) => {
+                if !self.expanded_quotes.remove(&message_id) {
+                    self.expanded_quotes.insert(message_id);
+                }
+                Vec::new()
+            }
+            InboxEvent::ReportError(msg) => {
+                self.loading_threads = false;
+                self.loading_conversation = false;
+                self.status_banner = Some(format!("Error: {msg}"));
                 Vec::new()
             }
         }
@@ -200,8 +224,14 @@ impl InboxState {
         if self.selected_thread.as_ref() == Some(&thread_id) && !self.conversation.is_empty() {
             return Vec::new();
         }
-        let op_id = self.alloc_op();
         self.selected_thread = Some(thread_id.clone());
+        if let Some(cached) = self.conversation_cache.get(&thread_id) {
+            self.active_thread_op = None;
+            self.loading_conversation = false;
+            self.conversation = cached.clone();
+            return Vec::new();
+        }
+        let op_id = self.alloc_op();
         self.active_thread_op = Some(op_id);
         self.loading_conversation = true;
         vec![InboxEffect::LoadConversation { op_id, thread_id }]

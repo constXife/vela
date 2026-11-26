@@ -6,8 +6,12 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+jiff.workspace = true
 jmap-client.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 vela-core.workspace = true
 zeroize.workspace = true
+
+[dev-dependencies]
+vela-flows.workspace = true

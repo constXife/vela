@@ -2,20 +2,27 @@
 
 //! Vela COSMIC desktop shell.
 //!
-//! Keeps all state transitions in `vela-flows` and focuses strictly on layout,
-//! widgets, and keyboard routing.
+//! Keeps all state transitions in `vela-flows` and runs all JMAP network I/O
+//! asynchronously off the UI thread so scrolling and keyboard triage stay smooth.
 
 mod sample;
+
+use std::sync::Arc;
 
 use cosmic::app::{Core, Settings, Task};
 use cosmic::iced::core::layout::Limits;
 use cosmic::iced::{Event, Length, Size, Subscription, event, keyboard};
 use cosmic::{Element, executor, widget};
-use vela_core::{MailboxId, MessageId, RemoteImagePolicy, ThreadId};
-use vela_flows::{InboxEffect, InboxEvent, InboxState};
+use vela_core::{
+    Mailbox, MailboxId, Message as MailMessage, MessageId, RemoteImagePolicy, ThreadId,
+    ThreadSummary,
+};
+use vela_flows::{InboxEffect, InboxEvent, InboxState, TriageAction, html};
+use vela_jmap::{JmapConfig, JmapSession, ThreadMutation};
 
 const WINDOW_SIZE: Size = Size::new(1280.0, 760.0);
 const WINDOW_MIN: Size = Size::new(960.0, 600.0);
+const INITIAL_THREAD_LIMIT: usize = 50;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
@@ -45,49 +52,134 @@ impl cosmic::app::CosmicFlags for Flags {
 struct App {
     core: Core,
     inbox: InboxState,
+    session: Option<Arc<JmapSession>>,
 }
 
 #[derive(Clone, Debug)]
 enum Message {
+    Connected(Result<(Arc<JmapSession>, Vec<Mailbox>), String>),
     SelectMailbox(MailboxId),
+    ThreadsLoaded {
+        op_id: vela_flows::OpId,
+        mailbox_id: MailboxId,
+        result: Result<Vec<ThreadSummary>, String>,
+    },
     SelectThread(ThreadId),
     SelectNext,
     SelectPrev,
+    ConversationLoaded {
+        op_id: vela_flows::OpId,
+        thread_id: ThreadId,
+        result: Result<Vec<MailMessage>, String>,
+    },
     Archive,
     Trash,
     ToggleRead,
     Undo,
+    TriageFinished(Result<(), String>),
     AllowRemoteImages(MessageId),
+    ToggleQuote(MessageId),
 }
 
 impl App {
-    fn dispatch(&mut self, event: InboxEvent) {
+    fn dispatch(&mut self, event: InboxEvent) -> Task<Message> {
         let effects = self.inbox.handle(event);
+        let mut tasks = Vec::new();
         for effect in effects {
-            self.execute_effect(effect);
+            tasks.push(self.execute_effect(effect));
         }
+        Task::batch(tasks)
     }
 
-    fn execute_effect(&mut self, effect: InboxEffect) {
+    fn execute_effect(&mut self, effect: InboxEffect) -> Task<Message> {
         match effect {
             InboxEffect::LoadThreads { op_id, mailbox_id } => {
-                let threads = sample::threads_for_mailbox(&mailbox_id);
-                self.dispatch(InboxEvent::ThreadsLoaded {
-                    op_id,
-                    mailbox_id,
-                    threads,
-                });
+                if let Some(session) = self.session.clone() {
+                    let mb = mailbox_id.clone();
+                    cosmic::task::future(async move {
+                        let result = session
+                            .list_threads(&mb, INITIAL_THREAD_LIMIT)
+                            .await
+                            .map_err(|e| e.to_string());
+                        Message::ThreadsLoaded {
+                            op_id,
+                            mailbox_id: mb,
+                            result,
+                        }
+                    })
+                } else {
+                    let threads = sample::threads_for_mailbox(&mailbox_id);
+                    self.dispatch(InboxEvent::ThreadsLoaded {
+                        op_id,
+                        mailbox_id,
+                        threads,
+                    })
+                }
             }
             InboxEffect::LoadConversation { op_id, thread_id } => {
-                let messages = sample::messages_for_thread(&thread_id);
-                self.dispatch(InboxEvent::ConversationLoaded {
-                    op_id,
-                    thread_id,
-                    messages,
-                });
+                if let Some(session) = self.session.clone() {
+                    let tid = thread_id.clone();
+                    cosmic::task::future(async move {
+                        let result = session
+                            .load_conversation(&tid)
+                            .await
+                            .map_err(|e| e.to_string());
+                        Message::ConversationLoaded {
+                            op_id,
+                            thread_id: tid,
+                            result,
+                        }
+                    })
+                } else {
+                    let messages = sample::messages_for_thread(&thread_id);
+                    self.dispatch(InboxEvent::ConversationLoaded {
+                        op_id,
+                        thread_id,
+                        messages,
+                    })
+                }
             }
-            InboxEffect::ApplyTriage { .. } | InboxEffect::RestoreThread { .. } => {
-                // In step 2 this dispatches an async JMAP `Email/set` off the UI thread.
+            InboxEffect::ApplyTriage {
+                thread_id,
+                action,
+                target_mailbox,
+                ..
+            } => {
+                let Some(session) = self.session.clone() else {
+                    return Task::none();
+                };
+                let mutation = match action {
+                    TriageAction::Archive | TriageAction::Trash => match target_mailbox {
+                        Some(target) => ThreadMutation::MoveToMailbox(target),
+                        None => return Task::none(),
+                    },
+                    TriageAction::ToggleRead { mark_unread } => {
+                        ThreadMutation::SetUnread(mark_unread)
+                    }
+                };
+                cosmic::task::future(async move {
+                    let result = session
+                        .mutate_thread(&thread_id, mutation)
+                        .await
+                        .map_err(|e| e.to_string());
+                    Message::TriageFinished(result)
+                })
+            }
+            InboxEffect::RestoreThread {
+                thread_id,
+                mailbox_ids,
+                ..
+            } => {
+                let Some(session) = self.session.clone() else {
+                    return Task::none();
+                };
+                cosmic::task::future(async move {
+                    let result = session
+                        .mutate_thread(&thread_id, ThreadMutation::RestoreMailboxes(mailbox_ids))
+                        .await
+                        .map_err(|e| e.to_string());
+                    Message::TriageFinished(result)
+                })
             }
         }
     }
@@ -112,9 +204,35 @@ impl cosmic::Application for App {
         let mut app = Self {
             core,
             inbox: InboxState::new(),
+            session: None,
         };
-        app.dispatch(InboxEvent::MailboxesLoaded(sample::mailboxes()));
-        (app, Task::none())
+
+        match JmapConfig::from_env() {
+            Ok(Some(config)) => {
+                app.inbox.status_banner = Some(format!("Connecting to {}…", config.server_url));
+                let task = cosmic::task::future(async move {
+                    let result = async {
+                        let session = Arc::new(JmapSession::connect(&config).await?);
+                        let mailboxes = session.list_mailboxes().await?;
+                        Ok::<_, vela_core::VelaError>((session, mailboxes))
+                    }
+                    .await
+                    .map_err(|e| e.to_string());
+                    Message::Connected(result)
+                });
+                (app, task)
+            }
+            Ok(None) => {
+                let task = app.dispatch(InboxEvent::MailboxesLoaded(sample::mailboxes()));
+                (app, task)
+            }
+            Err(err) => {
+                app.inbox.status_banner =
+                    Some(format!("Config error: {err} (showing sample data)"));
+                let task = app.dispatch(InboxEvent::MailboxesLoaded(sample::mailboxes()));
+                (app, task)
+            }
+        }
     }
 
     fn subscription(&self) -> Subscription<Self::Message> {
@@ -149,17 +267,51 @@ impl cosmic::Application for App {
 
     fn update(&mut self, message: Self::Message) -> Task<Self::Message> {
         match message {
+            Message::Connected(Ok((session, mailboxes))) => {
+                self.session = Some(session);
+                self.inbox.status_banner = None;
+                self.dispatch(InboxEvent::MailboxesLoaded(mailboxes))
+            }
+            Message::Connected(Err(err)) => self.dispatch(InboxEvent::ReportError(format!(
+                "JMAP connect failed: {err}"
+            ))),
             Message::SelectMailbox(id) => self.dispatch(InboxEvent::SelectMailbox(id)),
+            Message::ThreadsLoaded {
+                op_id,
+                mailbox_id,
+                result,
+            } => match result {
+                Ok(threads) => self.dispatch(InboxEvent::ThreadsLoaded {
+                    op_id,
+                    mailbox_id,
+                    threads,
+                }),
+                Err(err) => self.dispatch(InboxEvent::ReportError(err)),
+            },
             Message::SelectThread(id) => self.dispatch(InboxEvent::SelectThread(id)),
             Message::SelectNext => self.dispatch(InboxEvent::SelectNextThread),
             Message::SelectPrev => self.dispatch(InboxEvent::SelectPrevThread),
+            Message::ConversationLoaded {
+                op_id,
+                thread_id,
+                result,
+            } => match result {
+                Ok(messages) => self.dispatch(InboxEvent::ConversationLoaded {
+                    op_id,
+                    thread_id,
+                    messages,
+                }),
+                Err(err) => self.dispatch(InboxEvent::ReportError(err)),
+            },
             Message::Archive => self.dispatch(InboxEvent::ArchiveSelected),
             Message::Trash => self.dispatch(InboxEvent::TrashSelected),
             Message::ToggleRead => self.dispatch(InboxEvent::ToggleSelectedRead),
             Message::Undo => self.dispatch(InboxEvent::UndoLastTriage),
+            Message::TriageFinished(Ok(())) => Task::none(),
+            Message::TriageFinished(Err(err)) => self.dispatch(InboxEvent::ReportError(err)),
             Message::AllowRemoteImages(id) => self.dispatch(InboxEvent::AllowRemoteImages(id)),
+            Message::ToggleQuote(id) => self.dispatch(InboxEvent::ToggleQuote(id)),
         }
-        Task::none()
     }
 
     fn view(&self) -> Element<'_, Self::Message> {
@@ -176,22 +328,21 @@ impl cosmic::Application for App {
             .width(Length::Fill)
             .height(Length::Fill);
 
-        let mut root = widget::column::with_capacity(2)
+        let mut root = widget::column::with_capacity(3)
             .push(panes)
             .width(Length::Fill)
             .height(Length::Fill);
 
         if let Some(banner) = &self.inbox.status_banner {
-            let status_bar = widget::container(
-                widget::row::with_capacity(2)
-                    .push(widget::text::body(banner))
-                    .push(widget::space::horizontal())
-                    .push(widget::button::text("Undo (Z)").on_press(Message::Undo))
-                    .align_y(cosmic::iced::Alignment::Center)
-                    .spacing(12),
-            )
-            .padding([8, 16])
-            .width(Length::Fill);
+            let mut row = widget::row::with_capacity(3)
+                .push(widget::text::body(banner))
+                .push(widget::space::horizontal())
+                .align_y(cosmic::iced::Alignment::Center)
+                .spacing(12);
+            if self.inbox.last_undo.is_some() {
+                row = row.push(widget::button::text("Undo (Z)").on_press(Message::Undo));
+            }
+            let status_bar = widget::container(row).padding([8, 16]).width(Length::Fill);
             root = root
                 .push(widget::divider::horizontal::default())
                 .push(status_bar);
@@ -236,7 +387,9 @@ impl App {
             .spacing(6)
             .padding(12);
 
-        if self.inbox.threads.is_empty() {
+        if self.inbox.loading_threads {
+            list = list.push(widget::text::body("Loading conversations…"));
+        } else if self.inbox.threads.is_empty() {
             list = list.push(widget::text::body("No conversations in this mailbox."));
         } else {
             for thread in &self.inbox.threads {
@@ -281,7 +434,9 @@ impl App {
             .spacing(16)
             .padding(20);
 
-        if self.inbox.conversation.is_empty() {
+        if self.inbox.loading_conversation && self.inbox.conversation.is_empty() {
+            col = col.push(widget::text::body("Loading conversation…"));
+        } else if self.inbox.conversation.is_empty() {
             col = col.push(widget::text::body("Select a conversation to read."));
         } else {
             let toolbar = widget::row::with_capacity(3)
@@ -298,13 +453,22 @@ impl App {
                     .map(|a| a.display_name())
                     .collect::<Vec<_>>()
                     .join(", ");
+                let prepared =
+                    html::prepare_body(msg.text_body.as_deref(), msg.html_body.as_deref());
+                let has_remote = msg.has_remote_images || prepared.analysis.has_remote_images;
 
-                let mut card = widget::column::with_capacity(5)
+                let mut card = widget::column::with_capacity(7)
                     .spacing(8)
                     .push(widget::text::title4(&msg.subject))
                     .push(widget::text::caption(format!("From: {from}")));
 
-                if msg.has_remote_images {
+                if prepared.analysis.is_rich_layout {
+                    card = card.push(widget::text::caption(
+                        "HTML newsletter detected (rich layout renderer pending Blitz integration)",
+                    ));
+                }
+
+                if has_remote {
                     let policy = self.inbox.remote_image_policy(&msg.id);
                     if policy == RemoteImagePolicy::Block {
                         card = card.push(
@@ -324,11 +488,42 @@ impl App {
                     }
                 }
 
-                let body = msg
-                    .text_body
-                    .as_deref()
-                    .unwrap_or("(No plain-text preview available)");
+                let body = if prepared.main_text.is_empty() {
+                    "(Empty message body)".to_string()
+                } else {
+                    prepared.main_text
+                };
                 card = card.push(widget::text::body(body));
+
+                if let Some(quoted) = prepared.quoted_text {
+                    let expanded = self.inbox.expanded_quotes.contains(&msg.id);
+                    let toggle_label = if expanded {
+                        "Hide quoted text"
+                    } else {
+                        "⋯ Show quoted text"
+                    };
+                    card = card.push(
+                        widget::button::text(toggle_label)
+                            .on_press(Message::ToggleQuote(msg.id.clone())),
+                    );
+                    if expanded {
+                        card = card.push(widget::text::caption(quoted));
+                    }
+                }
+
+                let regular_attachments: Vec<_> =
+                    msg.attachments.iter().filter(|a| !a.is_inline).collect();
+                if !regular_attachments.is_empty() {
+                    let summary = regular_attachments
+                        .iter()
+                        .map(|a| {
+                            let name = a.name.as_deref().unwrap_or("attachment");
+                            format!("{name} ({} KB)", (a.size / 1024).max(1))
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" · ");
+                    card = card.push(widget::text::caption(format!("Attachments: {summary}")));
+                }
 
                 col = col.push(
                     widget::container(card)

@@ -14,6 +14,7 @@ license = "MIT"
 publish = false
 
 [workspace.dependencies]
+ammonia = "4"
 jiff = { version = "0.2", features = ["serde"] }
 jmap-client = { version = "0.3", default-features = false, features = ["async", "websockets"] }
 serde = { version = "1", features = ["derive"] }
@@ -32,4 +33,5 @@ libcosmic = { git = "https://github.com/pop-os/libcosmic", rev = "009fb9d4138f25
 ] }
 
 vela-core = { path = "crates/vela-core" }
+vela-jmap = { path = "crates/vela-jmap" }
 vela-flows = { path = "crates/vela-flows" }
