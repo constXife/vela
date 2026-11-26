@@ -1,0 +1,347 @@
+// SPDX-License-Identifier: MIT
+
+//! Vela COSMIC desktop shell.
+//!
+//! Keeps all state transitions in `vela-flows` and focuses strictly on layout,
+//! widgets, and keyboard routing.
+
+mod sample;
+
+use cosmic::app::{Core, Settings, Task};
+use cosmic::iced::core::layout::Limits;
+use cosmic::iced::{Event, Length, Size, Subscription, event, keyboard};
+use cosmic::{Element, executor, widget};
+use vela_core::{MailboxId, MessageId, RemoteImagePolicy, ThreadId};
+use vela_flows::{InboxEffect, InboxEvent, InboxState};
+
+const WINDOW_SIZE: Size = Size::new(1280.0, 760.0);
+const WINDOW_MIN: Size = Size::new(960.0, 600.0);
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("vela=info")),
+        )
+        .init();
+
+    let settings = Settings::default().size(WINDOW_SIZE).size_limits(
+        Limits::NONE
+            .min_width(WINDOW_MIN.width)
+            .min_height(WINDOW_MIN.height),
+    );
+    cosmic::app::run_single_instance::<App>(settings, Flags)?;
+    Ok(())
+}
+
+#[derive(Clone, Debug)]
+struct Flags;
+
+impl cosmic::app::CosmicFlags for Flags {
+    type SubCommand = String;
+    type Args = Vec<String>;
+}
+
+struct App {
+    core: Core,
+    inbox: InboxState,
+}
+
+#[derive(Clone, Debug)]
+enum Message {
+    SelectMailbox(MailboxId),
+    SelectThread(ThreadId),
+    SelectNext,
+    SelectPrev,
+    Archive,
+    Trash,
+    ToggleRead,
+    Undo,
+    AllowRemoteImages(MessageId),
+}
+
+impl App {
+    fn dispatch(&mut self, event: InboxEvent) {
+        let effects = self.inbox.handle(event);
+        for effect in effects {
+            self.execute_effect(effect);
+        }
+    }
+
+    fn execute_effect(&mut self, effect: InboxEffect) {
+        match effect {
+            InboxEffect::LoadThreads { op_id, mailbox_id } => {
+                let threads = sample::threads_for_mailbox(&mailbox_id);
+                self.dispatch(InboxEvent::ThreadsLoaded {
+                    op_id,
+                    mailbox_id,
+                    threads,
+                });
+            }
+            InboxEffect::LoadConversation { op_id, thread_id } => {
+                let messages = sample::messages_for_thread(&thread_id);
+                self.dispatch(InboxEvent::ConversationLoaded {
+                    op_id,
+                    thread_id,
+                    messages,
+                });
+            }
+            InboxEffect::ApplyTriage { .. } | InboxEffect::RestoreThread { .. } => {
+                // In step 2 this dispatches an async JMAP `Email/set` off the UI thread.
+            }
+        }
+    }
+}
+
+impl cosmic::Application for App {
+    type Executor = executor::Default;
+    type Flags = Flags;
+    type Message = Message;
+
+    const APP_ID: &'static str = "com.rlyeh.vela.Cosmic";
+
+    fn core(&self) -> &Core {
+        &self.core
+    }
+
+    fn core_mut(&mut self) -> &mut Core {
+        &mut self.core
+    }
+
+    fn init(core: Core, _flags: Self::Flags) -> (Self, Task<Self::Message>) {
+        let mut app = Self {
+            core,
+            inbox: InboxState::new(),
+        };
+        app.dispatch(InboxEvent::MailboxesLoaded(sample::mailboxes()));
+        (app, Task::none())
+    }
+
+    fn subscription(&self) -> Subscription<Self::Message> {
+        event::listen_with(|ev, status, _window| {
+            if matches!(status, event::Status::Captured) {
+                return None;
+            }
+            let Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) = ev else {
+                return None;
+            };
+            if modifiers.control() || modifiers.alt() || modifiers.logo() {
+                return None;
+            }
+            match key {
+                keyboard::Key::Named(keyboard::key::Named::ArrowDown) => Some(Message::SelectNext),
+                keyboard::Key::Named(keyboard::key::Named::ArrowUp) => Some(Message::SelectPrev),
+                keyboard::Key::Named(
+                    keyboard::key::Named::Delete | keyboard::key::Named::Backspace,
+                ) => Some(Message::Trash),
+                keyboard::Key::Character(ref c) => match c.as_str() {
+                    "j" => Some(Message::SelectNext),
+                    "k" => Some(Message::SelectPrev),
+                    "e" => Some(Message::Archive),
+                    "u" => Some(Message::ToggleRead),
+                    "z" => Some(Message::Undo),
+                    _ => None,
+                },
+                _ => None,
+            }
+        })
+    }
+
+    fn update(&mut self, message: Self::Message) -> Task<Self::Message> {
+        match message {
+            Message::SelectMailbox(id) => self.dispatch(InboxEvent::SelectMailbox(id)),
+            Message::SelectThread(id) => self.dispatch(InboxEvent::SelectThread(id)),
+            Message::SelectNext => self.dispatch(InboxEvent::SelectNextThread),
+            Message::SelectPrev => self.dispatch(InboxEvent::SelectPrevThread),
+            Message::Archive => self.dispatch(InboxEvent::ArchiveSelected),
+            Message::Trash => self.dispatch(InboxEvent::TrashSelected),
+            Message::ToggleRead => self.dispatch(InboxEvent::ToggleSelectedRead),
+            Message::Undo => self.dispatch(InboxEvent::UndoLastTriage),
+            Message::AllowRemoteImages(id) => self.dispatch(InboxEvent::AllowRemoteImages(id)),
+        }
+        Task::none()
+    }
+
+    fn view(&self) -> Element<'_, Self::Message> {
+        let mailboxes_col = self.view_mailboxes();
+        let threads_col = self.view_threads();
+        let conversation_col = self.view_conversation();
+
+        let panes = widget::row::with_capacity(5)
+            .push(mailboxes_col)
+            .push(widget::divider::vertical::default())
+            .push(threads_col)
+            .push(widget::divider::vertical::default())
+            .push(conversation_col)
+            .width(Length::Fill)
+            .height(Length::Fill);
+
+        let mut root = widget::column::with_capacity(2)
+            .push(panes)
+            .width(Length::Fill)
+            .height(Length::Fill);
+
+        if let Some(banner) = &self.inbox.status_banner {
+            let status_bar = widget::container(
+                widget::row::with_capacity(2)
+                    .push(widget::text::body(banner))
+                    .push(widget::space::horizontal())
+                    .push(widget::button::text("Undo (Z)").on_press(Message::Undo))
+                    .align_y(cosmic::iced::Alignment::Center)
+                    .spacing(12),
+            )
+            .padding([8, 16])
+            .width(Length::Fill);
+            root = root
+                .push(widget::divider::horizontal::default())
+                .push(status_bar);
+        }
+
+        root.into()
+    }
+}
+
+impl App {
+    fn view_mailboxes(&self) -> Element<'_, Message> {
+        let mut list = widget::column::with_capacity(self.inbox.mailboxes.len() + 1)
+            .spacing(4)
+            .padding(12);
+        list = list.push(widget::text::title4("Mailboxes"));
+
+        for mb in &self.inbox.mailboxes {
+            let selected = self.inbox.selected_mailbox.as_ref() == Some(&mb.id);
+            let label = if mb.unread_threads > 0 {
+                format!("{} ({})", mb.name, mb.unread_threads)
+            } else {
+                mb.name.clone()
+            };
+            let btn = if selected {
+                widget::button::suggested(label)
+            } else {
+                widget::button::text(label)
+            }
+            .width(Length::Fill)
+            .on_press(Message::SelectMailbox(mb.id.clone()));
+            list = list.push(btn);
+        }
+
+        widget::scrollable(list)
+            .width(Length::Fixed(210.0))
+            .height(Length::Fill)
+            .into()
+    }
+
+    fn view_threads(&self) -> Element<'_, Message> {
+        let mut list = widget::column::with_capacity(self.inbox.threads.len() + 1)
+            .spacing(6)
+            .padding(12);
+
+        if self.inbox.threads.is_empty() {
+            list = list.push(widget::text::body("No conversations in this mailbox."));
+        } else {
+            for thread in &self.inbox.threads {
+                let selected = self.inbox.selected_thread.as_ref() == Some(&thread.id);
+                let sender = thread
+                    .senders
+                    .first()
+                    .map(|s| s.display_name())
+                    .unwrap_or("Unknown");
+                let prefix = if thread.unread { "● " } else { "" };
+
+                let content = widget::column::with_capacity(3)
+                    .push(widget::text::body(format!(
+                        "{prefix}{sender} ({})",
+                        thread.message_count
+                    )))
+                    .push(widget::text::heading(&thread.subject))
+                    .push(widget::text::caption(&thread.snippet))
+                    .spacing(2);
+
+                let btn = if selected {
+                    widget::button::custom(content).class(cosmic::theme::Button::Suggested)
+                } else {
+                    widget::button::custom(content).class(cosmic::theme::Button::Text)
+                }
+                .padding(10)
+                .width(Length::Fill)
+                .on_press(Message::SelectThread(thread.id.clone()));
+
+                list = list.push(btn);
+            }
+        }
+
+        widget::scrollable(list)
+            .width(Length::Fixed(360.0))
+            .height(Length::Fill)
+            .into()
+    }
+
+    fn view_conversation(&self) -> Element<'_, Message> {
+        let mut col = widget::column::with_capacity(self.inbox.conversation.len() + 2)
+            .spacing(16)
+            .padding(20);
+
+        if self.inbox.conversation.is_empty() {
+            col = col.push(widget::text::body("Select a conversation to read."));
+        } else {
+            let toolbar = widget::row::with_capacity(3)
+                .push(widget::button::standard("Archive (E)").on_press(Message::Archive))
+                .push(widget::button::standard("Trash (Del)").on_press(Message::Trash))
+                .push(widget::button::standard("Read/Unread (U)").on_press(Message::ToggleRead))
+                .spacing(8);
+            col = col.push(toolbar);
+
+            for msg in &self.inbox.conversation {
+                let from = msg
+                    .from
+                    .iter()
+                    .map(|a| a.display_name())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+
+                let mut card = widget::column::with_capacity(5)
+                    .spacing(8)
+                    .push(widget::text::title4(&msg.subject))
+                    .push(widget::text::caption(format!("From: {from}")));
+
+                if msg.has_remote_images {
+                    let policy = self.inbox.remote_image_policy(&msg.id);
+                    if policy == RemoteImagePolicy::Block {
+                        card = card.push(
+                            widget::row::with_capacity(2)
+                                .push(widget::text::caption("External images are blocked."))
+                                .push(
+                                    widget::button::text("Load external images")
+                                        .on_press(Message::AllowRemoteImages(msg.id.clone())),
+                                )
+                                .spacing(8)
+                                .align_y(cosmic::iced::Alignment::Center),
+                        );
+                    } else {
+                        card = card.push(widget::text::caption(
+                            "External images enabled for this message.",
+                        ));
+                    }
+                }
+
+                let body = msg
+                    .text_body
+                    .as_deref()
+                    .unwrap_or("(No plain-text preview available)");
+                card = card.push(widget::text::body(body));
+
+                col = col.push(
+                    widget::container(card)
+                        .padding(14)
+                        .class(cosmic::theme::Container::Card)
+                        .width(Length::Fill),
+                );
+            }
+        }
+
+        widget::scrollable(col)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+    }
+}

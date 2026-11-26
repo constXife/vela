@@ -1,0 +1,12 @@
+[package]
+name = "vela-flows"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+vela-core.workspace = true
+
+[dev-dependencies]
+jiff.workspace = true

@@ -1,0 +1,19 @@
+[package]
+name = "vela-cosmic"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "vela-cosmic"
+path = "src/main.rs"
+
+[dependencies]
+jiff.workspace = true
+libcosmic.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+vela-core.workspace = true
+vela-flows.workspace = true
