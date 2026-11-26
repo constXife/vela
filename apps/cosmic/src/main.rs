@@ -224,6 +224,7 @@ struct App {
     threads_width: f32,
     resizing: Option<ResizeHandle>,
     auto_mark_read: bool,
+    body_editors: HashMap<MessageId, widget::text_editor::Content>,
 }
 
 type ConnectedAccount = (String, Arc<JmapSession>, Vec<Mailbox>, String);
@@ -326,6 +327,7 @@ enum Message {
     OpenUrl(&'static str),
     ThreadContextAction(ThreadMenuAction),
     CopyMessageAction(CopyMessageField),
+    BodyEditorAction(MessageId, widget::text_editor::Action),
 }
 
 impl App {
@@ -369,12 +371,38 @@ impl App {
         spawn_window.map(|opened_id| cosmic::Action::App(Message::SettingsWindowOpened(opened_id)))
     }
 
+    fn sync_body_editors(&mut self) {
+        let current_ids: HashSet<MessageId> = self
+            .inbox
+            .conversation
+            .iter()
+            .map(|m| m.id.clone())
+            .collect();
+        self.body_editors.retain(|id, _| current_ids.contains(id));
+        for msg in &self.inbox.conversation {
+            if !self.body_editors.contains_key(&msg.id) {
+                let prepared =
+                    html::prepare_body(msg.text_body.as_deref(), msg.html_body.as_deref());
+                let body = if prepared.main_text.is_empty() {
+                    "(Empty message body)".to_string()
+                } else {
+                    prepared.main_text
+                };
+                self.body_editors.insert(
+                    msg.id.clone(),
+                    widget::text_editor::Content::with_text(&body),
+                );
+            }
+        }
+    }
+
     fn dispatch(&mut self, event: InboxEvent) -> Task<Message> {
         let effects = self.inbox.handle(event);
         let mut tasks = Vec::new();
         for effect in effects {
             tasks.push(self.execute_effect(effect));
         }
+        self.sync_body_editors();
         Task::batch(tasks)
     }
 
@@ -596,6 +624,7 @@ impl cosmic::Application for App {
             threads_width: DEFAULT_THREADS_WIDTH,
             resizing: None,
             auto_mark_read: false,
+            body_editors: HashMap::new(),
         };
 
         if flags.sample_mode {
@@ -704,6 +733,7 @@ impl cosmic::Application for App {
                         snap.threads,
                         snap.conversation,
                     );
+                    self.sync_body_editors();
                     self.screen = Screen::Inbox;
                 }
                 Task::none()
@@ -902,6 +932,7 @@ impl cosmic::Application for App {
                 self.syncing = false;
                 self.sync_states = SyncStates::default();
                 self.inbox = InboxState::new();
+                self.body_editors.clear();
                 self.screen = Screen::Inbox;
                 self.dispatch(InboxEvent::MailboxesLoaded(sample::mailboxes()))
             }
@@ -918,6 +949,7 @@ impl cosmic::Application for App {
                     self.syncing = false;
                     self.sync_states = SyncStates::default();
                     self.inbox = InboxState::new();
+                    self.body_editors.clear();
                 }
                 cosmic::task::future(async move {
                     let next = store::remove_account(&account_id).await.ok().flatten();
@@ -941,6 +973,7 @@ impl cosmic::Application for App {
                 self.syncing = true;
                 self.sync_states = SyncStates::default();
                 self.inbox = InboxState::new();
+                self.body_editors.clear();
                 self.screen = Screen::Inbox;
                 spawn_account_load_tasks(account_id)
             }
@@ -951,6 +984,7 @@ impl cosmic::Application for App {
                 self.syncing = false;
                 self.sync_states = SyncStates::default();
                 self.inbox = InboxState::new();
+                self.body_editors.clear();
                 cosmic::task::future(async move {
                     let next_active = if let Some(account_id) = removing {
                         let next = store::remove_account(&account_id).await.ok().flatten();
@@ -1423,6 +1457,14 @@ impl cosmic::Application for App {
                         label: "subject",
                     }),
                 }
+            }
+            Message::BodyEditorAction(msg_id, action) => {
+                if !action.is_edit()
+                    && let Some(content) = self.body_editors.get_mut(&msg_id)
+                {
+                    content.perform(action);
+                }
+                Task::none()
             }
         }
     }
@@ -2719,9 +2761,22 @@ impl App {
                 .spacing(12)
                 .align_y(Alignment::Start);
 
+            let msg_menu = vec![
+                menu::Item::Button("Copy message text", None, CopyMessageField::Body(msg_idx)),
+                menu::Item::Button(
+                    "Copy sender address",
+                    None,
+                    CopyMessageField::Sender(msg_idx),
+                ),
+                menu::Item::Button("Copy subject", None, CopyMessageField::Subject(msg_idx)),
+            ];
+
             let mut card = widget::column::with_capacity(8)
                 .spacing(12)
-                .push(header_row)
+                .push(widget::context_menu(
+                    header_row,
+                    Some(menu::items(&HashMap::new(), msg_menu)),
+                ))
                 .push(widget::divider::horizontal::light());
 
             if has_remote {
@@ -2755,12 +2810,24 @@ impl App {
                 );
             }
 
-            let body = if prepared.main_text.is_empty() {
-                "(Empty message body)".to_string()
+            if let Some(editor_content) = self.body_editors.get(&msg.id) {
+                let msg_id = msg.id.clone();
+                card = card.push(
+                    widget::text_editor::text_editor(editor_content)
+                        .padding(0)
+                        .size(14.0)
+                        .wrapping(cosmic::iced::widget::text::Wrapping::WordOrGlyph)
+                        .style(readonly_body_editor_style)
+                        .on_action(move |action| Message::BodyEditorAction(msg_id.clone(), action)),
+                );
             } else {
-                prepared.main_text
-            };
-            card = card.push(widget::text::body(body));
+                let body = if prepared.main_text.is_empty() {
+                    "(Empty message body)".to_string()
+                } else {
+                    prepared.main_text
+                };
+                card = card.push(widget::text::body(body));
+            }
 
             if let Some(quoted) = prepared.quoted_text {
                 let expanded = self.inbox.expanded_quotes.contains(&msg.id);
@@ -2842,20 +2909,7 @@ impl App {
                 .class(cosmic::theme::Container::Card)
                 .width(Length::Fill);
 
-            let msg_menu = vec![
-                menu::Item::Button("Copy message text", None, CopyMessageField::Body(msg_idx)),
-                menu::Item::Button(
-                    "Copy sender address",
-                    None,
-                    CopyMessageField::Sender(msg_idx),
-                ),
-                menu::Item::Button("Copy subject", None, CopyMessageField::Subject(msg_idx)),
-            ];
-
-            col = col.push(widget::context_menu(
-                card_box,
-                Some(menu::items(&HashMap::new(), msg_menu)),
-            ));
+            col = col.push(card_box);
         }
 
         widget::column::with_capacity(3)
@@ -3171,4 +3225,24 @@ fn shortcut_section<'a>(title: &'a str, entries: &[(&'a str, &'a str)]) -> Eleme
     }
 
     col.into()
+}
+
+fn readonly_body_editor_style(
+    theme: &cosmic::Theme,
+    _status: widget::text_editor::Status,
+) -> widget::text_editor::Style {
+    let cosmic = theme.cosmic();
+    let mut selection: cosmic::iced::Color = cosmic.accent.base.into();
+    selection.a = 0.35;
+    widget::text_editor::Style {
+        background: cosmic::iced::Color::TRANSPARENT.into(),
+        border: cosmic::iced::Border {
+            radius: 0.0.into(),
+            width: 0.0,
+            color: cosmic::iced::Color::TRANSPARENT,
+        },
+        placeholder: cosmic.on_bg_color().into(),
+        value: cosmic.on_bg_color().into(),
+        selection,
+    }
 }
