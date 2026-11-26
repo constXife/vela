@@ -13,11 +13,12 @@ use std::sync::Arc;
 
 use cosmic::app::{Core, Settings, Task};
 use cosmic::iced::core::layout::Limits;
-use cosmic::iced::{Alignment, Event, Length, Size, Subscription, event, keyboard};
+use cosmic::iced::{Alignment, Color, Event, Length, Size, Subscription, event, keyboard};
 use cosmic::{Element, executor, widget};
+use jiff::{Timestamp, Zoned, tz::TimeZone};
 use vela_core::{
-    Mailbox, MailboxId, Message as MailMessage, MessageId, RemoteImagePolicy, ThreadId,
-    ThreadSummary,
+    EmailAddress, Mailbox, MailboxId, MailboxRole, Message as MailMessage, MessageId,
+    RemoteImagePolicy, ThreadId, ThreadSummary,
 };
 use vela_flows::{InboxEffect, InboxEvent, InboxState, TriageAction, html};
 use vela_jmap::{JmapConfig, JmapCredentials, JmapSession, ThreadMutation, store};
@@ -559,22 +560,33 @@ impl App {
         let mut list = widget::column::with_capacity(self.inbox.mailboxes.len() + 3)
             .spacing(4)
             .padding(12);
-        list = list.push(widget::text::title4("Mailboxes"));
+        list =
+            list.push(widget::container(widget::text::title4("Mailboxes")).padding([0, 4, 8, 4]));
 
         for mb in &self.inbox.mailboxes {
             let selected = self.inbox.selected_mailbox.as_ref() == Some(&mb.id);
-            let label = if mb.unread_threads > 0 {
-                format!("{} ({})", mb.name, mb.unread_threads)
-            } else {
-                mb.name.clone()
-            };
-            let btn = if selected {
-                widget::button::suggested(label)
-            } else {
-                widget::button::text(label)
+            let mut row = widget::row::with_capacity(4)
+                .spacing(10)
+                .align_y(Alignment::Center)
+                .push(widget::icon::from_name(mailbox_icon_name(mb.role)).size(16))
+                .push(widget::text::body(&mb.name));
+
+            if mb.unread_threads > 0 {
+                row = row.push(widget::space::horizontal()).push(
+                    widget::text::caption(mb.unread_threads.to_string()).class(if selected {
+                        cosmic::theme::Text::Accent
+                    } else {
+                        cosmic::theme::Text::Custom(muted_text_style)
+                    }),
+                );
             }
-            .width(Length::Fill)
-            .on_press(Message::SelectMailbox(mb.id.clone()));
+
+            let btn = widget::button::custom(row)
+                .class(cosmic::theme::Button::ListItem([8.0; 4]))
+                .selected(selected)
+                .padding([8, 10])
+                .width(Length::Fill)
+                .on_press(Message::SelectMailbox(mb.id.clone()));
             list = list.push(btn);
         }
 
@@ -594,21 +606,62 @@ impl App {
                 )
                 .padding(8),
             )
-            .width(Length::Fixed(210.0))
+            .width(Length::Fixed(220.0))
             .height(Length::Fill);
 
         sidebar.into()
     }
 
     fn view_threads(&self) -> Element<'_, Message> {
+        let active_mailbox = self
+            .inbox
+            .selected_mailbox
+            .as_ref()
+            .and_then(|id| self.inbox.mailboxes.iter().find(|mb| &mb.id == id));
+
+        let header_title = active_mailbox
+            .map(|mb| mb.name.as_str())
+            .unwrap_or("Messages");
+        let header_meta = match active_mailbox {
+            Some(mb) if mb.unread_threads > 0 => format!("{} unread", mb.unread_threads),
+            Some(_) => format!("{}", self.inbox.threads.len()),
+            None => String::new(),
+        };
+
+        let header = widget::container(
+            widget::row::with_capacity(3)
+                .push(widget::text::title4(header_title))
+                .push(widget::space::horizontal())
+                .push(
+                    widget::text::caption(header_meta)
+                        .class(cosmic::theme::Text::Custom(muted_text_style)),
+                )
+                .align_y(Alignment::Center),
+        )
+        .padding([12, 16])
+        .width(Length::Fill);
+
+        let now = Zoned::now();
         let mut list = widget::column::with_capacity(self.inbox.threads.len() + 1)
-            .spacing(6)
-            .padding(12);
+            .spacing(4)
+            .padding([8, 10]);
 
         if self.inbox.loading_threads {
-            list = list.push(widget::text::body("Loading conversations…"));
+            list = list.push(
+                widget::container(
+                    widget::text::body("Loading conversations…")
+                        .class(cosmic::theme::Text::Custom(muted_text_style)),
+                )
+                .padding(12),
+            );
         } else if self.inbox.threads.is_empty() {
-            list = list.push(widget::text::body("No conversations in this mailbox."));
+            list = list.push(
+                widget::container(
+                    widget::text::body("No conversations in this mailbox.")
+                        .class(cosmic::theme::Text::Custom(muted_text_style)),
+                )
+                .padding(12),
+            );
         } else {
             for thread in &self.inbox.threads {
                 let selected = self.inbox.selected_thread.as_ref() == Some(&thread.id);
@@ -617,144 +670,382 @@ impl App {
                     .first()
                     .map(|s| s.display_name())
                     .unwrap_or("Unknown");
-                let prefix = if thread.unread { "● " } else { "" };
+                let sender_display = html::clean_snippet(sender, 28);
+                let subject_display = html::clean_snippet(&thread.subject, 82);
+                let snippet_display = html::clean_snippet(&thread.snippet, 96);
+                let time_label = format_thread_time(thread.received_at, &now);
 
-                let content = widget::column::with_capacity(3)
-                    .push(widget::text::body(format!(
-                        "{prefix}{sender} ({})",
-                        thread.message_count
-                    )))
-                    .push(widget::text::heading(&thread.subject))
-                    .push(widget::text::caption(&thread.snippet))
-                    .spacing(2);
+                let mut top_row = widget::row::with_capacity(6)
+                    .spacing(6)
+                    .align_y(Alignment::Center);
 
-                let btn = if selected {
-                    widget::button::custom(content).class(cosmic::theme::Button::Suggested)
-                } else {
-                    widget::button::custom(content).class(cosmic::theme::Button::Text)
+                if thread.unread {
+                    top_row =
+                        top_row.push(widget::text::caption("●").class(cosmic::theme::Text::Accent));
                 }
-                .padding(10)
-                .width(Length::Fill)
-                .on_press(Message::SelectThread(thread.id.clone()));
+
+                let sender_widget = if thread.unread {
+                    widget::text::heading(sender_display)
+                        .class(cosmic::theme::Text::Custom(primary_text_style))
+                } else {
+                    widget::text::body(sender_display)
+                        .class(cosmic::theme::Text::Custom(primary_text_style))
+                };
+                top_row = top_row.push(sender_widget);
+
+                if thread.message_count > 1 {
+                    top_row = top_row.push(
+                        widget::text::caption(format!("({})", thread.message_count))
+                            .class(cosmic::theme::Text::Custom(muted_text_style)),
+                    );
+                }
+
+                top_row = top_row.push(widget::space::horizontal());
+
+                if thread.flagged {
+                    top_row =
+                        top_row.push(widget::text::caption("★").class(cosmic::theme::Text::Accent));
+                }
+                if thread.has_attachments {
+                    top_row =
+                        top_row.push(widget::icon::from_name("mail-attachment-symbolic").size(14));
+                }
+
+                top_row = top_row.push(widget::text::caption(time_label).class(if thread.unread {
+                    cosmic::theme::Text::Accent
+                } else {
+                    cosmic::theme::Text::Custom(muted_text_style)
+                }));
+
+                let subject_widget = if thread.unread {
+                    widget::text::body(subject_display)
+                        .class(cosmic::theme::Text::Custom(primary_text_style))
+                } else {
+                    widget::text::body(subject_display)
+                        .class(cosmic::theme::Text::Custom(secondary_text_style))
+                };
+
+                let mut content = widget::column::with_capacity(3)
+                    .push(top_row)
+                    .push(subject_widget)
+                    .spacing(3);
+
+                if !snippet_display.is_empty() {
+                    content = content.push(
+                        widget::text::caption(snippet_display)
+                            .class(cosmic::theme::Text::Custom(muted_text_style)),
+                    );
+                }
+
+                let btn = widget::button::custom(content)
+                    .class(cosmic::theme::Button::ListItem([8.0; 4]))
+                    .selected(selected)
+                    .padding([10, 12])
+                    .width(Length::Fill)
+                    .on_press(Message::SelectThread(thread.id.clone()));
 
                 list = list.push(btn);
             }
         }
 
-        widget::scrollable(list)
-            .width(Length::Fixed(360.0))
+        widget::column::with_capacity(3)
+            .push(header)
+            .push(widget::divider::horizontal::default())
+            .push(widget::scrollable(list).height(Length::Fill))
+            .width(Length::Fixed(370.0))
             .height(Length::Fill)
             .into()
     }
 
     fn view_conversation(&self) -> Element<'_, Message> {
-        let mut col = widget::column::with_capacity(self.inbox.conversation.len() + 2)
+        let selected_unread = self
+            .inbox
+            .selected_thread
+            .as_ref()
+            .and_then(|id| self.inbox.threads.iter().find(|t| &t.id == id))
+            .map(|t| t.unread)
+            .unwrap_or(false);
+
+        if self.inbox.loading_conversation && self.inbox.conversation.is_empty() {
+            return widget::container(
+                widget::text::body("Loading conversation…")
+                    .class(cosmic::theme::Text::Custom(muted_text_style)),
+            )
+            .center(Length::Fill)
+            .into();
+        }
+
+        if self.inbox.conversation.is_empty() {
+            return widget::container(
+                widget::text::body("Select a conversation to read.")
+                    .class(cosmic::theme::Text::Custom(muted_text_style)),
+            )
+            .center(Length::Fill)
+            .into();
+        }
+
+        let read_label = if selected_unread {
+            "Mark read"
+        } else {
+            "Mark unread"
+        };
+        let read_icon = if selected_unread {
+            "mail-read-symbolic"
+        } else {
+            "mail-unread-symbolic"
+        };
+
+        let toolbar = widget::container(
+            widget::row::with_capacity(3)
+                .push(widget::tooltip(
+                    widget::button::standard("Archive")
+                        .leading_icon(widget::icon::from_name("folder-documents-symbolic").handle())
+                        .on_press(Message::Archive),
+                    widget::text::caption("Archive (E)"),
+                    widget::tooltip::Position::Bottom,
+                ))
+                .push(widget::tooltip(
+                    widget::button::standard("Trash")
+                        .leading_icon(widget::icon::from_name("user-trash-symbolic").handle())
+                        .on_press(Message::Trash),
+                    widget::text::caption("Move to Trash (Del)"),
+                    widget::tooltip::Position::Bottom,
+                ))
+                .push(widget::tooltip(
+                    widget::button::standard(read_label)
+                        .leading_icon(widget::icon::from_name(read_icon).handle())
+                        .on_press(Message::ToggleRead),
+                    widget::text::caption("Toggle Read/Unread (U)"),
+                    widget::tooltip::Position::Bottom,
+                ))
+                .spacing(8)
+                .align_y(Alignment::Center),
+        )
+        .padding([10, 20])
+        .width(Length::Fill);
+
+        let mut col = widget::column::with_capacity(self.inbox.conversation.len())
             .spacing(16)
             .padding(20);
 
-        if self.inbox.loading_conversation && self.inbox.conversation.is_empty() {
-            col = col.push(widget::text::body("Loading conversation…"));
-        } else if self.inbox.conversation.is_empty() {
-            col = col.push(widget::text::body("Select a conversation to read."));
-        } else {
-            let toolbar = widget::row::with_capacity(3)
-                .push(widget::button::standard("Archive (E)").on_press(Message::Archive))
-                .push(widget::button::standard("Trash (Del)").on_press(Message::Trash))
-                .push(widget::button::standard("Read/Unread (U)").on_press(Message::ToggleRead))
-                .spacing(8);
-            col = col.push(toolbar);
+        for msg in &self.inbox.conversation {
+            let from = format_address_list(&msg.from);
+            let to = format_address_list(&msg.to);
+            let cc = format_address_list(&msg.cc);
+            let timestamp = format_full_time(msg.received_at);
+            let prepared = html::prepare_body(msg.text_body.as_deref(), msg.html_body.as_deref());
+            let has_remote = msg.has_remote_images || prepared.analysis.has_remote_images;
 
-            for msg in &self.inbox.conversation {
-                let from = msg
-                    .from
-                    .iter()
-                    .map(|a| a.display_name())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let prepared =
-                    html::prepare_body(msg.text_body.as_deref(), msg.html_body.as_deref());
-                let has_remote = msg.has_remote_images || prepared.analysis.has_remote_images;
+            let mut header_col = widget::column::with_capacity(5)
+                .spacing(4)
+                .push(widget::text::title4(&msg.subject))
+                .push(
+                    widget::row::with_capacity(3)
+                        .push(
+                            widget::text::body(format!("From: {from}"))
+                                .class(cosmic::theme::Text::Custom(primary_text_style)),
+                        )
+                        .push(widget::space::horizontal())
+                        .push(
+                            widget::text::caption(timestamp)
+                                .class(cosmic::theme::Text::Custom(muted_text_style)),
+                        )
+                        .spacing(12)
+                        .align_y(Alignment::Center),
+                );
 
-                let mut card = widget::column::with_capacity(7)
-                    .spacing(8)
-                    .push(widget::text::title4(&msg.subject))
-                    .push(widget::text::caption(format!("From: {from}")));
-
-                if prepared.analysis.is_rich_layout {
-                    card = card.push(widget::text::caption(
-                        "HTML newsletter detected (rich layout renderer pending Blitz integration)",
-                    ));
-                }
-
-                if has_remote {
-                    let policy = self.inbox.remote_image_policy(&msg.id);
-                    if policy == RemoteImagePolicy::Block {
-                        card = card.push(
-                            widget::row::with_capacity(2)
-                                .push(widget::text::caption("External images are blocked."))
-                                .push(
-                                    widget::button::text("Load external images")
-                                        .on_press(Message::AllowRemoteImages(msg.id.clone())),
-                                )
-                                .spacing(8)
-                                .align_y(Alignment::Center),
-                        );
-                    } else {
-                        card = card.push(widget::text::caption(
-                            "External images enabled for this message.",
-                        ));
-                    }
-                }
-
-                let body = if prepared.main_text.is_empty() {
-                    "(Empty message body)".to_string()
-                } else {
-                    prepared.main_text
-                };
-                card = card.push(widget::text::body(body));
-
-                if let Some(quoted) = prepared.quoted_text {
-                    let expanded = self.inbox.expanded_quotes.contains(&msg.id);
-                    let toggle_label = if expanded {
-                        "Hide quoted text"
-                    } else {
-                        "⋯ Show quoted text"
-                    };
-                    card = card.push(
-                        widget::button::text(toggle_label)
-                            .on_press(Message::ToggleQuote(msg.id.clone())),
-                    );
-                    if expanded {
-                        card = card.push(widget::text::caption(quoted));
-                    }
-                }
-
-                let regular_attachments: Vec<_> =
-                    msg.attachments.iter().filter(|a| !a.is_inline).collect();
-                if !regular_attachments.is_empty() {
-                    let summary = regular_attachments
-                        .iter()
-                        .map(|a| {
-                            let name = a.name.as_deref().unwrap_or("attachment");
-                            format!("{name} ({} KB)", (a.size / 1024).max(1))
-                        })
-                        .collect::<Vec<_>>()
-                        .join(" · ");
-                    card = card.push(widget::text::caption(format!("Attachments: {summary}")));
-                }
-
-                col = col.push(
-                    widget::container(card)
-                        .padding(14)
-                        .class(cosmic::theme::Container::Card)
-                        .width(Length::Fill),
+            if !to.is_empty() {
+                header_col = header_col.push(
+                    widget::text::caption(format!("To: {to}"))
+                        .class(cosmic::theme::Text::Custom(muted_text_style)),
                 );
             }
+            if !cc.is_empty() {
+                header_col = header_col.push(
+                    widget::text::caption(format!("Cc: {cc}"))
+                        .class(cosmic::theme::Text::Custom(muted_text_style)),
+                );
+            }
+
+            let mut card = widget::column::with_capacity(8)
+                .spacing(10)
+                .push(header_col)
+                .push(widget::divider::horizontal::light());
+
+            if has_remote {
+                let policy = self.inbox.remote_image_policy(&msg.id);
+                let banner_content: Element<'_, Message> = if policy == RemoteImagePolicy::Block {
+                    widget::row::with_capacity(3)
+                        .push(widget::icon::from_name("image-x-generic-symbolic").size(16))
+                        .push(
+                            widget::text::caption("External images are blocked for privacy.")
+                                .class(cosmic::theme::Text::Custom(muted_text_style)),
+                        )
+                        .push(widget::space::horizontal())
+                        .push(
+                            widget::button::text("Load images")
+                                .on_press(Message::AllowRemoteImages(msg.id.clone())),
+                        )
+                        .spacing(8)
+                        .align_y(Alignment::Center)
+                        .into()
+                } else {
+                    widget::text::caption("External images enabled for this message.")
+                        .class(cosmic::theme::Text::Custom(muted_text_style))
+                        .into()
+                };
+
+                card = card.push(
+                    widget::container(banner_content)
+                        .padding([6, 10])
+                        .width(Length::Fill)
+                        .class(cosmic::theme::Container::Primary),
+                );
+            }
+
+            let body = if prepared.main_text.is_empty() {
+                "(Empty message body)".to_string()
+            } else {
+                prepared.main_text
+            };
+            card = card.push(widget::text::body(body));
+
+            if let Some(quoted) = prepared.quoted_text {
+                let expanded = self.inbox.expanded_quotes.contains(&msg.id);
+                let toggle_label = if expanded {
+                    "Hide quoted text"
+                } else {
+                    "⋯ Show quoted text"
+                };
+                card = card.push(
+                    widget::button::text(toggle_label)
+                        .on_press(Message::ToggleQuote(msg.id.clone())),
+                );
+                if expanded {
+                    card = card.push(
+                        widget::text::caption(quoted)
+                            .class(cosmic::theme::Text::Custom(muted_text_style)),
+                    );
+                }
+            }
+
+            let regular_attachments: Vec<_> =
+                msg.attachments.iter().filter(|a| !a.is_inline).collect();
+            if !regular_attachments.is_empty() {
+                let summary = regular_attachments
+                    .iter()
+                    .map(|a| {
+                        let name = a.name.as_deref().unwrap_or("attachment");
+                        format!("{name} ({} KB)", (a.size / 1024).max(1))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" · ");
+                card = card.push(widget::divider::horizontal::light()).push(
+                    widget::row::with_capacity(2)
+                        .push(widget::icon::from_name("mail-attachment-symbolic").size(16))
+                        .push(
+                            widget::text::caption(summary)
+                                .class(cosmic::theme::Text::Custom(muted_text_style)),
+                        )
+                        .spacing(8)
+                        .align_y(Alignment::Center),
+                );
+            }
+
+            col = col.push(
+                widget::container(card)
+                    .padding(16)
+                    .class(cosmic::theme::Container::Card)
+                    .width(Length::Fill),
+            );
         }
 
-        widget::scrollable(col)
+        widget::column::with_capacity(3)
+            .push(toolbar)
+            .push(widget::divider::horizontal::default())
+            .push(
+                widget::scrollable(col)
+                    .width(Length::Fill)
+                    .height(Length::Fill),
+            )
             .width(Length::Fill)
             .height(Length::Fill)
             .into()
+    }
+}
+
+fn mailbox_icon_name(role: MailboxRole) -> &'static str {
+    match role {
+        MailboxRole::Inbox => "mail-inbox-symbolic",
+        MailboxRole::Drafts => "document-edit-symbolic",
+        MailboxRole::Sent => "mail-send-symbolic",
+        MailboxRole::Archive => "folder-documents-symbolic",
+        MailboxRole::Junk => "mail-mark-junk-symbolic",
+        MailboxRole::Trash => "user-trash-symbolic",
+        MailboxRole::Custom => "folder-symbolic",
+    }
+}
+
+fn format_address(addr: &EmailAddress) -> String {
+    match addr.name.as_deref().map(str::trim) {
+        Some(name) if !name.is_empty() && !name.eq_ignore_ascii_case(&addr.email) => {
+            format!("{name} <{}>", addr.email)
+        }
+        _ => addr.email.clone(),
+    }
+}
+
+fn format_address_list(addrs: &[EmailAddress]) -> String {
+    addrs
+        .iter()
+        .map(format_address)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn format_thread_time(ts: Timestamp, now: &Zoned) -> String {
+    let local = ts.to_zoned(TimeZone::system());
+    let today = now.date();
+    let msg_date = local.date();
+
+    if msg_date == today {
+        local.strftime("%H:%M").to_string()
+    } else if msg_date.tomorrow().ok() == Some(today) {
+        "Yesterday".to_string()
+    } else if msg_date.year() == today.year() {
+        local.strftime("%b %-d").to_string()
+    } else {
+        local.strftime("%b %-d, %Y").to_string()
+    }
+}
+
+fn format_full_time(ts: Timestamp) -> String {
+    let local = ts.to_zoned(TimeZone::system());
+    local.strftime("%b %-d, %Y · %H:%M").to_string()
+}
+
+fn primary_text_style(theme: &cosmic::Theme) -> cosmic::iced::widget::text::Style {
+    let color: Color = theme.cosmic().on_bg_color().into();
+    cosmic::iced::widget::text::Style {
+        color: Some(color),
+        ..Default::default()
+    }
+}
+
+fn secondary_text_style(theme: &cosmic::Theme) -> cosmic::iced::widget::text::Style {
+    let mut color: Color = theme.cosmic().on_bg_color().into();
+    color.a = 0.82;
+    cosmic::iced::widget::text::Style {
+        color: Some(color),
+        ..Default::default()
+    }
+}
+
+fn muted_text_style(theme: &cosmic::Theme) -> cosmic::iced::widget::text::Style {
+    let mut color: Color = theme.cosmic().on_bg_color().into();
+    color.a = 0.60;
+    cosmic::iced::widget::text::Style {
+        color: Some(color),
+        ..Default::default()
     }
 }

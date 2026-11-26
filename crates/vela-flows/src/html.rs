@@ -102,7 +102,23 @@ pub fn prepare_body(text_body: Option<&str>, html_body: Option<&str>) -> Prepare
     let analysis = html_body.map(analyze_html).unwrap_or_default();
 
     let raw_text = match (text_body, html_body) {
-        (Some(text), _) if !text.trim().is_empty() => text.to_string(),
+        (Some(text), html) if !text.trim().is_empty() => {
+            if looks_like_html(text) {
+                let cleaned_text = html_to_readable_text(text);
+                if let Some(html_src) = html {
+                    let cleaned_html = html_to_readable_text(html_src);
+                    if cleaned_text.len() < 16 && cleaned_html.len() > cleaned_text.len() {
+                        cleaned_html
+                    } else {
+                        cleaned_text
+                    }
+                } else {
+                    cleaned_text
+                }
+            } else {
+                text.to_string()
+            }
+        }
         (_, Some(html)) => html_to_readable_text(html),
         _ => String::new(),
     };
@@ -113,6 +129,65 @@ pub fn prepare_body(text_body: Option<&str>, html_body: Option<&str>) -> Prepare
         quoted_text,
         analysis,
     }
+}
+
+/// Sanitize and compact a thread preview/snippet into a single readable line
+/// bounded to `max_chars` Unicode scalar values.
+///
+/// Handles servers that return raw/truncated HTML (such as `<!DOCTYPE html>...<style>`)
+/// or stray closing tags in JMAP `preview` fields.
+pub fn clean_snippet(raw: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+
+    let text = if looks_like_html(raw) {
+        html_to_readable_text(raw)
+    } else {
+        raw.to_string()
+    };
+
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let char_count = collapsed.chars().count();
+    if char_count <= max_chars {
+        return collapsed;
+    }
+
+    let take = max_chars.saturating_sub(1);
+    let mut truncated: String = collapsed.chars().take(take).collect();
+    if let Some(last_space) = truncated.rfind(' ')
+        && last_space >= take / 2
+    {
+        truncated.truncate(last_space);
+    }
+    let trimmed = truncated.trim_end_matches(|c: char| c.is_whitespace() || matches!(c, ',' | ';'));
+    format!("{trimmed}…")
+}
+
+/// Heuristic check for HTML markup or fragments accidentally embedded in
+/// `text/plain` bodies or JMAP `preview` strings.
+fn looks_like_html(input: &str) -> bool {
+    let lower = input.to_ascii_lowercase();
+    const MARKERS: &[&str] = &[
+        "<!doctype",
+        "<html",
+        "<head",
+        "<style",
+        "<body",
+        "<table",
+        "<div",
+        "<span",
+        "<p>",
+        "<p ",
+        "</p>",
+        "<br",
+        "<a ",
+        "<img",
+        "<meta",
+        "<tr",
+        "<td",
+    ];
+    MARKERS.iter().any(|m| lower.contains(m))
 }
 
 /// Convert sanitized HTML into clean readable plain text while preserving
@@ -308,5 +383,42 @@ mod tests {
         let (main, quoted) = split_quoted_text(body);
         assert_eq!(main, "Sounds good, let's ship it!");
         assert!(quoted.unwrap().contains("Shall we deploy?"));
+    }
+
+    #[test]
+    fn clean_snippet_strips_truncated_html_and_css() {
+        let raw = r#"<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head>
+<style type="text/css">
+*{
+  -ms-text-size-adjust:100%;
+  -web..."#;
+        assert_eq!(clean_snippet(raw, 90), "");
+    }
+
+    #[test]
+    fn clean_snippet_strips_stray_tags_and_compacts_lines() {
+        assert_eq!(clean_snippet("</p>int", 90), "int");
+
+        let multiline = "via paddle.com\nYour subscription has been canceled.\nYour subscription was canceled on\nSep 3, 2026 9:31 am UTC.";
+        let compacted = clean_snippet(multiline, 60);
+        assert!(!compacted.contains('\n'));
+        assert!(compacted.ends_with('…'));
+        assert!(compacted.chars().count() <= 60);
+    }
+
+    #[test]
+    fn prepare_body_cleans_broken_html_in_text_body() {
+        let prepared = prepare_body(
+            Some("</p>int"),
+            Some(
+                "<html><body><p>Full delivery report succeeded for domain example.com.</p></body></html>",
+            ),
+        );
+        assert_eq!(
+            prepared.main_text,
+            "Full delivery report succeeded for domain example.com."
+        );
     }
 }
