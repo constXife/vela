@@ -1,3 +1,5 @@
+set dotenv-load
+
 # Run all fast headless tests (core + jmap + flows)
 test:
     cargo test --workspace
@@ -10,3 +12,7 @@ lint:
 # Run the COSMIC desktop shell
 run:
     cargo run -p vela-cosmic
+
+# Inspect the latest 15 threads in a live Stalwart JMAP mailbox
+inspect:
+    cargo run -p vela-jmap --example inspect_mailbox
