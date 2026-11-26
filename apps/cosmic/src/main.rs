@@ -9,15 +9,17 @@
 
 mod sample;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use cosmic::app::{Core, Settings, Task};
+use cosmic::iced::clipboard;
 use cosmic::iced::core::layout::Limits;
 use cosmic::iced::{
     Alignment, Color, Event, Length, Size, Subscription, event, keyboard, mouse, window,
 };
+use cosmic::widget::menu;
 use cosmic::{ApplicationExt, Element, executor, widget};
 use jiff::{Timestamp, Zoned, tz::TimeZone};
 use vela_cache::VelaCache;
@@ -92,6 +94,40 @@ enum SettingsTab {
     Accounts,
     Reading,
     Storage,
+    About,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ThreadMenuAction {
+    ToggleRead(usize),
+    ToggleFlag(usize),
+    Archive(usize),
+    RestoreToInbox(usize),
+    Trash(usize),
+    CopySubject(usize),
+}
+
+impl menu::Action for ThreadMenuAction {
+    type Message = Message;
+
+    fn message(&self) -> Self::Message {
+        Message::ThreadContextAction(*self)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CopyMessageField {
+    Body(usize),
+    Sender(usize),
+    Subject(usize),
+}
+
+impl menu::Action for CopyMessageField {
+    type Message = Message;
+
+    fn message(&self) -> Self::Message {
+        Message::CopyMessageAction(*self)
+    }
 }
 
 struct ConnectForm {
@@ -182,6 +218,7 @@ struct App {
     settings_window: Option<window::Id>,
     settings_tab: SettingsTab,
     add_account_form: ConnectForm,
+    editing_account_id: Option<String>,
     show_sidebar: bool,
     sidebar_width: f32,
     threads_width: f32,
@@ -280,6 +317,15 @@ enum Message {
     ResetPaneWidths,
     ClearCacheAndResync,
     CacheCleared(Option<Arc<VelaCache>>),
+    EditAccount(String),
+    CancelEditAccount,
+    CopyToClipboard {
+        text: String,
+        label: &'static str,
+    },
+    OpenUrl(&'static str),
+    ThreadContextAction(ThreadMenuAction),
+    CopyMessageAction(CopyMessageField),
 }
 
 impl App {
@@ -544,6 +590,7 @@ impl cosmic::Application for App {
             settings_window: None,
             settings_tab: SettingsTab::Accounts,
             add_account_form: ConnectForm::fresh_empty(),
+            editing_account_id: None,
             show_sidebar: true,
             sidebar_width: DEFAULT_SIDEBAR_WIDTH,
             threads_width: DEFAULT_THREADS_WIDTH,
@@ -776,11 +823,21 @@ impl cosmic::Application for App {
                     server_url,
                     credentials,
                 };
+                let replacing_id = self.editing_account_id.clone();
                 cosmic::task::future(async move {
                     let result = async {
                         let session = Arc::new(JmapSession::connect(&config).await?);
                         let (mailboxes, mb_state) = session.list_mailboxes_with_state().await?;
                         let saved = store::save_jmap_config(&config).await?;
+                        if let Some(old_id) = replacing_id
+                            && old_id != saved.id
+                        {
+                            let _ = store::remove_account(&old_id).await;
+                            let _ = tokio::task::spawn_blocking(move || {
+                                vela_cache::destroy_account_cache(&old_id)
+                            })
+                            .await;
+                        }
                         Ok::<_, vela_core::VelaError>((saved.id, session, mailboxes, mb_state))
                     }
                     .await
@@ -794,6 +851,7 @@ impl cosmic::Application for App {
                 }
                 self.add_account_form.wipe_password();
                 self.add_account_form = ConnectForm::fresh_empty();
+                self.editing_account_id = None;
                 self.refresh_accounts_from_disk();
                 self.active_account_id = Some(account_id.clone());
                 self.sync_states = SyncStates {
@@ -1268,6 +1326,104 @@ impl cosmic::Application for App {
                 self.inbox.status_banner = Some("Local cache cleared — syncing…".into());
                 self.update(Message::SyncNow)
             }
+            Message::EditAccount(account_id) => {
+                if let Some(acc) = self.accounts.iter().find(|a| a.id == account_id).cloned() {
+                    self.add_account_form.wipe_password();
+                    self.add_account_form = ConnectForm {
+                        server_url: acc.server_url,
+                        username: acc.username,
+                        password: String::new(),
+                        auth_kind: acc.auth_kind,
+                        password_hidden: true,
+                        connecting: false,
+                        error: None,
+                    };
+                    self.editing_account_id = Some(account_id);
+                }
+                self.open_settings_window(SettingsTab::Accounts)
+            }
+            Message::CancelEditAccount => {
+                self.add_account_form.wipe_password();
+                self.add_account_form = ConnectForm::fresh_empty();
+                self.editing_account_id = None;
+                Task::none()
+            }
+            Message::CopyToClipboard { text, label } => {
+                self.inbox.last_undo = None;
+                self.last_saved_attachment = None;
+                self.inbox.status_banner = Some(format!("Copied {label} to clipboard"));
+                clipboard::write(text)
+            }
+            Message::OpenUrl(url) => {
+                let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+                Task::none()
+            }
+            Message::ThreadContextAction(action) => {
+                let idx = match action {
+                    ThreadMenuAction::ToggleRead(i)
+                    | ThreadMenuAction::ToggleFlag(i)
+                    | ThreadMenuAction::Archive(i)
+                    | ThreadMenuAction::RestoreToInbox(i)
+                    | ThreadMenuAction::Trash(i)
+                    | ThreadMenuAction::CopySubject(i) => i,
+                };
+                let Some(thread) = self.inbox.threads.get(idx).cloned() else {
+                    return Task::none();
+                };
+                if let ThreadMenuAction::CopySubject(_) = action {
+                    return self.update(Message::CopyToClipboard {
+                        text: thread.subject,
+                        label: "subject",
+                    });
+                }
+                let select_task = self.dispatch(InboxEvent::SelectThread(thread.id));
+                let action_task = match action {
+                    ThreadMenuAction::ToggleRead(_) => {
+                        self.dispatch(InboxEvent::ToggleSelectedRead)
+                    }
+                    ThreadMenuAction::ToggleFlag(_) => {
+                        self.dispatch(InboxEvent::ToggleSelectedFlag)
+                    }
+                    ThreadMenuAction::Archive(_) => self.dispatch(InboxEvent::ArchiveSelected),
+                    ThreadMenuAction::RestoreToInbox(_) => {
+                        self.dispatch(InboxEvent::MoveSelectedToInbox)
+                    }
+                    ThreadMenuAction::Trash(_) => self.dispatch(InboxEvent::TrashSelected),
+                    ThreadMenuAction::CopySubject(_) => Task::none(),
+                };
+                Task::batch([select_task, action_task])
+            }
+            Message::CopyMessageAction(action) => {
+                let idx = match action {
+                    CopyMessageField::Body(i)
+                    | CopyMessageField::Sender(i)
+                    | CopyMessageField::Subject(i) => i,
+                };
+                let Some(msg) = self.inbox.conversation.get(idx) else {
+                    return Task::none();
+                };
+                match action {
+                    CopyMessageField::Body(_) => {
+                        let prepared =
+                            html::prepare_body(msg.text_body.as_deref(), msg.html_body.as_deref());
+                        self.update(Message::CopyToClipboard {
+                            text: prepared.main_text,
+                            label: "message text",
+                        })
+                    }
+                    CopyMessageField::Sender(_) => {
+                        let sender = format_address_list(&msg.from);
+                        self.update(Message::CopyToClipboard {
+                            text: sender,
+                            label: "sender address",
+                        })
+                    }
+                    CopyMessageField::Subject(_) => self.update(Message::CopyToClipboard {
+                        text: msg.subject.clone(),
+                        label: "subject",
+                    }),
+                }
+            }
         }
     }
 
@@ -1365,7 +1521,7 @@ impl App {
                 .on_press(Message::SelectSettingsTab(tab))
         };
 
-        let nav = widget::column::with_capacity(3)
+        let nav = widget::column::with_capacity(4)
             .spacing(4)
             .padding(12)
             .width(Length::Fixed(200.0))
@@ -1383,6 +1539,11 @@ impl App {
                 SettingsTab::Storage,
                 "folder-symbolic",
                 "Layout & Cache",
+            ))
+            .push(nav_item(
+                SettingsTab::About,
+                "dialog-information-symbolic",
+                "About",
             ));
 
         let page: Element<'_, Message> = match self.settings_tab {
@@ -1393,8 +1554,8 @@ impl App {
                     let mut section = widget::settings::section().title("Connected Accounts");
                     for acc in &self.accounts {
                         let is_active = self.active_account_id.as_deref() == Some(acc.id.as_str());
-                        let mut controls = widget::row::with_capacity(2)
-                            .spacing(8)
+                        let mut controls = widget::row::with_capacity(3)
+                            .spacing(6)
                             .align_y(Alignment::Center);
                         if !is_active {
                             controls = controls.push(
@@ -1406,10 +1567,15 @@ impl App {
                                 widget::text::caption("Active").class(cosmic::theme::Text::Accent),
                             );
                         }
-                        controls = controls.push(
-                            widget::button::text("Remove")
-                                .on_press(Message::RemoveAccount(acc.id.clone())),
-                        );
+                        controls = controls
+                            .push(
+                                widget::button::text("Edit")
+                                    .on_press(Message::EditAccount(acc.id.clone())),
+                            )
+                            .push(
+                                widget::button::text("Remove")
+                                    .on_press(Message::RemoveAccount(acc.id.clone())),
+                            );
 
                         section = section.add(
                             widget::settings::item::builder(acc.username.clone())
@@ -1420,10 +1586,23 @@ impl App {
                     col = col.push(section);
                 }
 
+                let mut form_header = widget::row::with_capacity(3)
+                    .align_y(Alignment::Center)
+                    .push(widget::text::title4(if self.editing_account_id.is_some() {
+                        "Edit Account"
+                    } else {
+                        "Add JMAP Account"
+                    }));
+                if self.editing_account_id.is_some() {
+                    form_header = form_header
+                        .push(widget::space::horizontal())
+                        .push(widget::button::text("Cancel").on_press(Message::CancelEditAccount));
+                }
+
                 let add_card = widget::container(
                     widget::column::with_capacity(2)
                         .spacing(12)
-                        .push(widget::text::title4("Add JMAP Account"))
+                        .push(form_header)
                         .push(self.view_connect_form(&self.add_account_form, false)),
                 )
                 .padding(18)
@@ -1493,6 +1672,52 @@ impl App {
                     .spacing(16)
                     .push(layout_section)
                     .push(cache_section)
+                    .into()
+            }
+            SettingsTab::About => {
+                let about_card = widget::container(
+                    widget::column::with_capacity(5)
+                        .spacing(8)
+                        .push(widget::text::title2("Vela"))
+                        .push(
+                            widget::text::caption(format!("Version {}", env!("CARGO_PKG_VERSION")))
+                                .class(cosmic::theme::Text::Custom(muted_text_style)),
+                        )
+                        .push(widget::text::body(
+                            "Fast, privacy-first native COSMIC desktop email client for JMAP servers.",
+                        ))
+                        .push(
+                            widget::text::caption("Rust · libcosmic · JMAP · SQLCipher · MCP")
+                                .class(cosmic::theme::Text::Custom(muted_text_style)),
+                        ),
+                )
+                .padding(20)
+                .width(Length::Fill)
+                .class(cosmic::theme::Container::Card);
+
+                let links_section =
+                    widget::settings::section()
+                        .title("Project")
+                        .add(
+                            widget::settings::item::builder("Repository")
+                                .description("https://github.com/constXife/vela")
+                                .control(widget::button::standard("Open GitHub").on_press(
+                                    Message::OpenUrl("https://github.com/constXife/vela"),
+                                )),
+                        )
+                        .add(
+                            widget::settings::item::builder("License")
+                                .description("Open-source software")
+                                .control(
+                                    widget::text::caption("MIT")
+                                        .class(cosmic::theme::Text::Custom(muted_text_style)),
+                                ),
+                        );
+
+                widget::column::with_capacity(2)
+                    .spacing(16)
+                    .push(about_card)
+                    .push(links_section)
                     .into()
             }
         };
@@ -2110,7 +2335,71 @@ impl App {
                     .width(Length::Fill)
                     .on_press(Message::SelectThread(thread.id.clone()));
 
-                list = list.push(btn);
+                let active_role = active_mailbox.map(|mb| mb.role);
+                let real_idx = self
+                    .inbox
+                    .threads
+                    .iter()
+                    .position(|t| t.id == thread.id)
+                    .unwrap_or(idx);
+                let mut menu_items = vec![
+                    menu::Item::Button(
+                        if thread.unread {
+                            "Mark read"
+                        } else {
+                            "Mark unread"
+                        },
+                        None,
+                        ThreadMenuAction::ToggleRead(real_idx),
+                    ),
+                    menu::Item::Button(
+                        if thread.flagged { "Unflag" } else { "Flag" },
+                        None,
+                        ThreadMenuAction::ToggleFlag(real_idx),
+                    ),
+                    menu::Item::Divider,
+                ];
+                match active_role {
+                    Some(MailboxRole::Trash | MailboxRole::Junk) => {
+                        menu_items.push(menu::Item::Button(
+                            "Restore to Inbox",
+                            None,
+                            ThreadMenuAction::RestoreToInbox(real_idx),
+                        ));
+                    }
+                    Some(MailboxRole::Archive) => {
+                        menu_items.push(menu::Item::Button(
+                            "Move to Inbox",
+                            None,
+                            ThreadMenuAction::RestoreToInbox(real_idx),
+                        ));
+                    }
+                    _ => {
+                        menu_items.push(menu::Item::Button(
+                            "Archive",
+                            None,
+                            ThreadMenuAction::Archive(real_idx),
+                        ));
+                    }
+                }
+                if active_role != Some(MailboxRole::Trash) {
+                    menu_items.push(menu::Item::Button(
+                        "Move to Trash",
+                        None,
+                        ThreadMenuAction::Trash(real_idx),
+                    ));
+                }
+                menu_items.push(menu::Item::Divider);
+                menu_items.push(menu::Item::Button(
+                    "Copy subject",
+                    None,
+                    ThreadMenuAction::CopySubject(real_idx),
+                ));
+
+                let wrapped =
+                    widget::context_menu(btn, Some(menu::items(&HashMap::new(), menu_items)));
+
+                list = list.push(wrapped);
 
                 if idx + 1 < thread_count {
                     let sep: Element<'_, Message> = if !selected && !next_selected {
@@ -2348,7 +2637,7 @@ impl App {
             .max_width(840.0)
             .push(widget::text::title3(thread_subject));
 
-        for msg in &self.inbox.conversation {
+        for (msg_idx, msg) in self.inbox.conversation.iter().enumerate() {
             let primary_sender = msg.from.first();
             let sender_name = primary_sender
                 .map(|a| a.display_name())
@@ -2367,8 +2656,20 @@ impl App {
             .center(Length::Fixed(32.0))
             .class(cosmic::theme::Container::custom(avatar_container_style));
 
+            let copy_btn = widget::tooltip(
+                widget::button::icon(widget::icon::from_name("edit-copy-symbolic"))
+                    .icon_size(14)
+                    .padding(4)
+                    .on_press(Message::CopyToClipboard {
+                        text: prepared.main_text.clone(),
+                        label: "message text",
+                    }),
+                widget::text::caption("Copy message text"),
+                widget::tooltip::Position::Bottom,
+            );
+
             let mut meta_col = widget::column::with_capacity(3).spacing(2).push(
-                widget::row::with_capacity(3)
+                widget::row::with_capacity(4)
                     .push(
                         widget::text::heading(sender_name)
                             .class(cosmic::theme::Text::Custom(primary_text_style)),
@@ -2378,7 +2679,8 @@ impl App {
                         widget::text::caption(timestamp)
                             .class(cosmic::theme::Text::Custom(muted_text_style)),
                     )
-                    .spacing(12)
+                    .push(copy_btn)
+                    .spacing(8)
                     .align_y(Alignment::Center),
             );
 
@@ -2535,12 +2837,25 @@ impl App {
                     .push(widget::flex_row(chips).row_spacing(8).column_spacing(8));
             }
 
-            col = col.push(
-                widget::container(card)
-                    .padding(16)
-                    .class(cosmic::theme::Container::Card)
-                    .width(Length::Fill),
-            );
+            let card_box = widget::container(card)
+                .padding(16)
+                .class(cosmic::theme::Container::Card)
+                .width(Length::Fill);
+
+            let msg_menu = vec![
+                menu::Item::Button("Copy message text", None, CopyMessageField::Body(msg_idx)),
+                menu::Item::Button(
+                    "Copy sender address",
+                    None,
+                    CopyMessageField::Sender(msg_idx),
+                ),
+                menu::Item::Button("Copy subject", None, CopyMessageField::Subject(msg_idx)),
+            ];
+
+            col = col.push(widget::context_menu(
+                card_box,
+                Some(menu::items(&HashMap::new(), msg_menu)),
+            ));
         }
 
         widget::column::with_capacity(3)
