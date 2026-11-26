@@ -311,10 +311,11 @@ impl App {
             return window::gain_focus(id);
         }
         let (id, spawn_window) = window::open(window::Settings {
-            size: Size::new(760.0, 560.0),
-            min_size: Some(Size::new(620.0, 440.0)),
+            size: Size::new(780.0, 580.0),
+            min_size: Some(Size::new(640.0, 460.0)),
             exit_on_close_request: false,
             decorations: false,
+            transparent: false,
             ..Default::default()
         });
         self.settings_window = Some(id);
@@ -1498,13 +1499,18 @@ impl App {
             .width(Length::Fill)
             .height(Length::Fill);
 
-        widget::column::with_capacity(3)
-            .push(header)
-            .push(widget::divider::horizontal::default())
-            .push(body)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into()
+        widget::container(
+            widget::column::with_capacity(3)
+                .push(header)
+                .push(widget::divider::horizontal::default())
+                .push(body)
+                .width(Length::Fill)
+                .height(Length::Fill),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .class(cosmic::theme::Container::Background)
+        .into()
     }
 
     fn view_shortcuts_dialog(&self) -> Element<'_, Message> {
