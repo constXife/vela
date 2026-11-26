@@ -158,6 +158,21 @@ impl InboxState {
         self.filter != ThreadFilter::All || !self.search_query.trim().is_empty()
     }
 
+    /// Evict specific threads from the in-memory conversation cache when JMAP
+    /// reports them as updated or destroyed.
+    pub fn invalidate_cached_threads(&mut self, thread_ids: &[ThreadId]) {
+        for tid in thread_ids {
+            self.conversation_cache.remove(tid);
+            if let Some(pos) = self
+                .conversation_cache_order
+                .iter()
+                .position(|id| id == tid)
+            {
+                self.conversation_cache_order.remove(pos);
+            }
+        }
+    }
+
     /// Threads matching the current `All`/`Unread` filter and search query
     /// (combining live substring matching with SQLCipher FTS5 full-body hits).
     pub fn visible_threads(&self) -> Vec<&ThreadSummary> {

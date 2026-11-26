@@ -24,7 +24,9 @@ use vela_core::{
     MessageId, RemoteImagePolicy, ThreadId, ThreadSummary,
 };
 use vela_flows::{InboxEffect, InboxEvent, InboxState, ThreadFilter, TriageAction, html};
-use vela_jmap::{JmapConfig, JmapCredentials, JmapSession, ThreadMutation, store};
+use vela_jmap::{
+    ChangesCheck, JmapConfig, JmapCredentials, JmapSession, SyncStates, ThreadMutation, store,
+};
 use zeroize::Zeroize;
 
 const WINDOW_SIZE: Size = Size::new(1280.0, 760.0);
@@ -112,12 +114,13 @@ struct App {
     cache: Option<Arc<VelaCache>>,
     account: Option<(String, String)>,
     syncing: bool,
+    sync_states: SyncStates,
     downloading_blobs: HashSet<BlobId>,
     last_saved_attachment: Option<PathBuf>,
     show_shortcuts: bool,
 }
 
-type ConnectedAccount = (Arc<JmapSession>, Vec<Mailbox>);
+type ConnectedAccount = (Arc<JmapSession>, Vec<Mailbox>, String);
 
 #[derive(Clone, Debug)]
 struct CachedSnapshot {
@@ -126,6 +129,7 @@ struct CachedSnapshot {
     mailbox_id: Option<MailboxId>,
     threads: Vec<ThreadSummary>,
     conversation: Option<(ThreadId, Vec<MailMessage>)>,
+    sync_states: SyncStates,
 }
 
 #[derive(Clone, Debug)]
@@ -145,7 +149,7 @@ enum Message {
     ThreadsLoaded {
         op_id: vela_flows::OpId,
         mailbox_id: MailboxId,
-        result: Result<Vec<ThreadSummary>, String>,
+        result: Result<(Vec<ThreadSummary>, SyncStates), String>,
     },
     SelectThread(ThreadId),
     SelectNext,
@@ -171,7 +175,8 @@ enum Message {
     SetFilter(ThreadFilter),
     ClearFilters,
     SyncNow,
-    SyncMailboxesFinished(Result<Vec<Mailbox>, String>),
+    SyncChangesChecked(Result<ChangesCheck, String>),
+    SyncMailboxesFinished(Result<(Vec<Mailbox>, String), String>),
     DownloadAttachment(Attachment),
     AttachmentDownloaded {
         blob_id: BlobId,
@@ -215,7 +220,7 @@ impl App {
                     let mb = mailbox_id.clone();
                     cosmic::task::future(async move {
                         let result = session
-                            .list_threads(&mb, INITIAL_THREAD_LIMIT)
+                            .list_threads_with_state(&mb, INITIAL_THREAD_LIMIT)
                             .await
                             .map_err(|e| e.to_string());
                         Message::ThreadsLoaded {
@@ -370,6 +375,7 @@ impl cosmic::Application for App {
             cache: None,
             account: initial_account,
             syncing: !flags.sample_mode,
+            sync_states: SyncStates::default(),
             downloading_blobs: HashSet::new(),
             last_saved_attachment: None,
             show_shortcuts: false,
@@ -408,12 +414,18 @@ impl cosmic::Application for App {
                         .flatten()
                         .map(|msgs| (t.id.clone(), msgs))
                 });
+                let sync_states = SyncStates {
+                    mailbox_state: cache.get_sync_state("mailbox_state").ok().flatten(),
+                    email_state: cache.get_sync_state("email_state").ok().flatten(),
+                    thread_state: cache.get_sync_state("thread_state").ok().flatten(),
+                };
                 Some(Box::new(CachedSnapshot {
                     cache,
                     mailboxes,
                     mailbox_id: initial_mb,
                     threads,
                     conversation,
+                    sync_states,
                 }))
             })
             .await
@@ -428,8 +440,8 @@ impl cosmic::Application for App {
                     return Ok(None);
                 };
                 let session = Arc::new(JmapSession::connect(&config).await?);
-                let mailboxes = session.list_mailboxes().await?;
-                Ok::<_, vela_core::VelaError>(Some((session, mailboxes)))
+                let (mailboxes, mb_state) = session.list_mailboxes_with_state().await?;
+                Ok::<_, vela_core::VelaError>(Some((session, mailboxes, mb_state)))
             }
             .await
             .map_err(|e| e.to_string());
@@ -481,6 +493,15 @@ impl cosmic::Application for App {
         match message {
             Message::CacheWarmed(Some(snap)) => {
                 self.cache = Some(snap.cache);
+                if self.sync_states.mailbox_state.is_none() {
+                    self.sync_states.mailbox_state = snap.sync_states.mailbox_state;
+                }
+                if self.sync_states.email_state.is_none() {
+                    self.sync_states.email_state = snap.sync_states.email_state;
+                }
+                if self.sync_states.thread_state.is_none() {
+                    self.sync_states.thread_state = snap.sync_states.thread_state;
+                }
                 if self.session.is_none()
                     && !snap.mailboxes.is_empty()
                     && !matches!(self.screen, Screen::Connect(_))
@@ -501,19 +522,24 @@ impl cosmic::Application for App {
                     if !self.inbox.mailboxes.is_empty() {
                         let c = cache.clone();
                         let mbs = self.inbox.mailboxes.clone();
+                        let states = self.sync_states.clone();
                         tokio::task::spawn_blocking(move || {
                             let _ = c.save_mailboxes(&mbs);
+                            persist_sync_states(&c, &states);
                         });
                     }
                     self.cache = Some(cache);
                 }
                 Task::none()
             }
-            Message::StartupResolved(Ok(Some((session, mailboxes)))) => {
+            Message::StartupResolved(Ok(Some((session, mailboxes, mb_state)))) => {
+                self.sync_states.mailbox_state = Some(mb_state);
                 if let Some(cache) = self.cache.clone() {
                     let mbs = mailboxes.clone();
+                    let states = self.sync_states.clone();
                     tokio::task::spawn_blocking(move || {
                         let _ = cache.save_mailboxes(&mbs);
+                        persist_sync_states(&cache, &states);
                     });
                 }
                 self.session = Some(session);
@@ -582,23 +608,30 @@ impl cosmic::Application for App {
                 cosmic::task::future(async move {
                     let result = async {
                         let session = Arc::new(JmapSession::connect(&config).await?);
-                        let mailboxes = session.list_mailboxes().await?;
+                        let (mailboxes, mb_state) = session.list_mailboxes_with_state().await?;
                         store::save_jmap_config(&config).await?;
-                        Ok::<_, vela_core::VelaError>((session, mailboxes))
+                        Ok::<_, vela_core::VelaError>((session, mailboxes, mb_state))
                     }
                     .await
                     .map_err(|e| e.to_string());
                     Message::ConnectFinished(result)
                 })
             }
-            Message::ConnectFinished(Ok((session, mailboxes))) => {
+            Message::ConnectFinished(Ok((session, mailboxes, mb_state))) => {
                 if let Screen::Connect(form) = &mut self.screen {
                     form.wipe_password();
                 }
+                self.sync_states = SyncStates {
+                    mailbox_state: Some(mb_state),
+                    email_state: None,
+                    thread_state: None,
+                };
                 if let Some(cache) = self.cache.clone() {
                     let mbs = mailboxes.clone();
+                    let states = self.sync_states.clone();
                     tokio::task::spawn_blocking(move || {
                         let _ = cache.save_mailboxes(&mbs);
+                        persist_sync_states(&cache, &states);
                     });
                 }
                 self.session = Some(session);
@@ -642,6 +675,7 @@ impl cosmic::Application for App {
                 self.cache = None;
                 self.account = None;
                 self.syncing = false;
+                self.sync_states = SyncStates::default();
                 self.inbox = InboxState::new();
                 self.screen = Screen::Inbox;
                 self.dispatch(InboxEvent::MailboxesLoaded(sample::mailboxes()))
@@ -651,6 +685,7 @@ impl cosmic::Application for App {
                 self.cache = None;
                 self.account = None;
                 self.syncing = false;
+                self.sync_states = SyncStates::default();
                 self.inbox = InboxState::new();
                 cosmic::task::future(async move {
                     let _ = store::clear_saved_secret().await;
@@ -669,12 +704,20 @@ impl cosmic::Application for App {
                 mailbox_id,
                 result,
             } => match result {
-                Ok(threads) => {
+                Ok((threads, states)) => {
+                    if let Some(email_state) = states.email_state {
+                        self.sync_states.email_state = Some(email_state);
+                    }
+                    if let Some(thread_state) = states.thread_state {
+                        self.sync_states.thread_state = Some(thread_state);
+                    }
                     if let Some(cache) = self.cache.clone() {
                         let mb = mailbox_id.clone();
                         let ts = threads.clone();
+                        let st = self.sync_states.clone();
                         tokio::task::spawn_blocking(move || {
                             let _ = cache.save_threads(&mb, &ts);
+                            persist_sync_states(&cache, &st);
                         });
                     }
                     self.dispatch(InboxEvent::ThreadsLoaded {
@@ -755,17 +798,56 @@ impl cosmic::Application for App {
                     return Task::none();
                 };
                 self.syncing = true;
+                let since = self.sync_states.clone();
                 cosmic::task::future(async move {
-                    let result = session.list_mailboxes().await.map_err(|e| e.to_string());
+                    let result = session
+                        .check_changes(&since)
+                        .await
+                        .map_err(|e| e.to_string());
+                    Message::SyncChangesChecked(result)
+                })
+            }
+            Message::SyncChangesChecked(Ok(check)) => {
+                if !check.invalidated_threads.is_empty() {
+                    self.inbox
+                        .invalidate_cached_threads(&check.invalidated_threads);
+                    if let Some(cache) = self.cache.clone() {
+                        let invalid = check.invalidated_threads.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let _ = cache.invalidate_threads(&invalid);
+                        });
+                    }
+                }
+                if !check.mailboxes_changed && !check.emails_changed && !check.threads_changed {
+                    self.syncing = false;
+                    return Task::none();
+                }
+                self.sync_states = check.new_states;
+                let Some(session) = self.session.clone() else {
+                    self.syncing = false;
+                    return Task::none();
+                };
+                cosmic::task::future(async move {
+                    let result = session
+                        .list_mailboxes_with_state()
+                        .await
+                        .map_err(|e| e.to_string());
                     Message::SyncMailboxesFinished(result)
                 })
             }
-            Message::SyncMailboxesFinished(Ok(mailboxes)) => {
+            Message::SyncChangesChecked(Err(err)) => {
                 self.syncing = false;
+                self.dispatch(InboxEvent::ReportError(format!("Sync failed: {err}")))
+            }
+            Message::SyncMailboxesFinished(Ok((mailboxes, mb_state))) => {
+                self.syncing = false;
+                self.sync_states.mailbox_state = Some(mb_state);
                 if let Some(cache) = self.cache.clone() {
                     let mbs = mailboxes.clone();
+                    let st = self.sync_states.clone();
                     tokio::task::spawn_blocking(move || {
                         let _ = cache.save_mailboxes(&mbs);
+                        persist_sync_states(&cache, &st);
                     });
                 }
                 self.dispatch(InboxEvent::MailboxesLoaded(mailboxes))
@@ -1702,6 +1784,18 @@ impl App {
             .width(Length::Fill)
             .height(Length::Fill)
             .into()
+    }
+}
+
+fn persist_sync_states(cache: &VelaCache, states: &SyncStates) {
+    if let Some(s) = &states.mailbox_state {
+        let _ = cache.set_sync_state("mailbox_state", s);
+    }
+    if let Some(s) = &states.email_state {
+        let _ = cache.set_sync_state("email_state", s);
+    }
+    if let Some(s) = &states.thread_state {
+        let _ = cache.set_sync_state("thread_state", s);
     }
 }
 

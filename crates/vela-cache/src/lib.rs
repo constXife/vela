@@ -522,6 +522,30 @@ impl VelaCache {
         Ok(())
     }
 
+    /// Selectively evict cached messages and FTS entries for threads reported
+    /// as updated or destroyed by JMAP `Thread/changes`.
+    pub fn invalidate_threads(&self, thread_ids: &[ThreadId]) -> Result<(), VelaError> {
+        if thread_ids.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.lock_conn()?;
+        let tx = conn.transaction().map_err(db_err)?;
+        {
+            let mut del_msgs = tx
+                .prepare("DELETE FROM messages WHERE thread_id = ?1")
+                .map_err(db_err)?;
+            let mut del_fts = tx
+                .prepare("DELETE FROM messages_fts WHERE thread_id = ?1")
+                .map_err(db_err)?;
+            for tid in thread_ids {
+                del_msgs.execute(params![tid.0]).map_err(db_err)?;
+                del_fts.execute(params![tid.0]).map_err(db_err)?;
+            }
+        }
+        tx.commit().map_err(db_err)?;
+        Ok(())
+    }
+
     fn lock_conn(&self) -> Result<std::sync::MutexGuard<'_, Connection>, VelaError> {
         self.conn
             .lock()
@@ -754,6 +778,13 @@ mod tests {
         // FTS5 search finds the thread.
         let hits = cache.search_threads(secret_marker, 10).unwrap();
         assert_eq!(hits, vec![thread_id.clone()]);
+
+        // Selective invalidation removes only the invalidated thread's messages & FTS entry.
+        cache
+            .invalidate_threads(std::slice::from_ref(&thread_id))
+            .unwrap();
+        assert_eq!(cache.load_conversation(&thread_id).unwrap(), None);
+        assert!(cache.search_threads(secret_marker, 10).unwrap().is_empty());
 
         drop(cache);
 

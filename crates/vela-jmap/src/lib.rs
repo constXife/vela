@@ -97,6 +97,24 @@ pub enum ThreadMutation {
     RestoreMailboxes(Vec<MailboxId>),
 }
 
+/// JMAP state tokens tracked for incremental `/changes` synchronization.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SyncStates {
+    pub mailbox_state: Option<String>,
+    pub email_state: Option<String>,
+    pub thread_state: Option<String>,
+}
+
+/// Result of a batched `Mailbox/changes` + `Email/changes` + `Thread/changes` check.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChangesCheck {
+    pub mailboxes_changed: bool,
+    pub emails_changed: bool,
+    pub threads_changed: bool,
+    pub invalidated_threads: Vec<ThreadId>,
+    pub new_states: SyncStates,
+}
+
 /// Live JMAP session handle wrapping `jmap-client`.
 pub struct JmapSession {
     client: jmap_client::client::Client,
@@ -138,13 +156,20 @@ impl JmapSession {
 
     /// Fetch all mailboxes in a single `Mailbox/get` request, sorted by role.
     pub async fn list_mailboxes(&self) -> Result<Vec<Mailbox>, VelaError> {
+        let (mailboxes, _) = self.list_mailboxes_with_state().await?;
+        Ok(mailboxes)
+    }
+
+    /// Fetch all mailboxes along with the server's `Mailbox` JMAP state token.
+    pub async fn list_mailboxes_with_state(&self) -> Result<(Vec<Mailbox>, String), VelaError> {
         let mut request = self.client.build();
         request.get_mailbox();
-        let list = request
+        let mut resp = request
             .send_get_mailbox()
             .await
-            .map_err(|err| VelaError::Transport(err.to_string()))?
-            .take_list();
+            .map_err(|err| VelaError::Transport(err.to_string()))?;
+        let state = resp.state().to_string();
+        let list = resp.take_list();
 
         let mut mailboxes: Vec<Mailbox> = list
             .into_iter()
@@ -171,7 +196,7 @@ impl JmapSession {
                 .cmp(&b.role.sort_rank())
                 .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
         });
-        Ok(mailboxes)
+        Ok((mailboxes, state))
     }
 
     /// Fetch collapsed thread summaries for a mailbox in a single batched HTTP
@@ -181,6 +206,16 @@ impl JmapSession {
         mailbox_id: &MailboxId,
         limit: usize,
     ) -> Result<Vec<ThreadSummary>, VelaError> {
+        let (threads, _) = self.list_threads_with_state(mailbox_id, limit).await?;
+        Ok(threads)
+    }
+
+    /// Fetch collapsed thread summaries along with `Email` and `Thread` JMAP state tokens.
+    pub async fn list_threads_with_state(
+        &self,
+        mailbox_id: &MailboxId,
+        limit: usize,
+    ) -> Result<(Vec<ThreadSummary>, SyncStates), VelaError> {
         let mut request = self.client.build();
 
         let query = request.query_email();
@@ -284,7 +319,128 @@ impl JmapSession {
             });
         }
 
-        Ok(summaries)
+        let states = SyncStates {
+            mailbox_state: None,
+            email_state: Some(emails_resp.state().to_string()),
+            thread_state: Some(threads_resp.state().to_string()),
+        };
+
+        Ok((summaries, states))
+    }
+
+    /// Check for incremental server-side changes since `since` using a single
+    /// batched `Mailbox/changes` + `Email/changes` + `Thread/changes` roundtrip.
+    ///
+    /// If any stored state token is missing or rejected by the server
+    /// (`cannotCalculateChanges`), that resource is flagged as changed so the
+    /// caller can fall back to a clean full refresh.
+    pub async fn check_changes(&self, since: &SyncStates) -> Result<ChangesCheck, VelaError> {
+        let mut request = self.client.build();
+        let mut requested_mb = false;
+        let mut requested_email = false;
+        let mut requested_thread = false;
+
+        if let Some(state) = since.mailbox_state.as_deref().filter(|s| !s.is_empty()) {
+            request.changes_mailbox(state);
+            requested_mb = true;
+        }
+        if let Some(state) = since.email_state.as_deref().filter(|s| !s.is_empty()) {
+            request.changes_email(state);
+            requested_email = true;
+        }
+        if let Some(state) = since.thread_state.as_deref().filter(|s| !s.is_empty()) {
+            request.changes_thread(state);
+            requested_thread = true;
+        }
+
+        if !requested_mb && !requested_email && !requested_thread {
+            return Ok(ChangesCheck {
+                mailboxes_changed: true,
+                emails_changed: true,
+                threads_changed: true,
+                invalidated_threads: Vec::new(),
+                new_states: SyncStates::default(),
+            });
+        }
+
+        let response = request
+            .send()
+            .await
+            .map_err(|err| VelaError::Transport(err.to_string()))?;
+        let mut responses = response.unwrap_method_responses().into_iter();
+
+        let mut mailboxes_changed = !requested_mb;
+        let mut emails_changed = !requested_email;
+        let mut threads_changed = !requested_thread;
+        let mut invalidated_threads = Vec::new();
+        let mut new_states = since.clone();
+
+        if requested_mb {
+            match responses
+                .next()
+                .and_then(|r| r.unwrap_changes_mailbox().ok())
+            {
+                Some(ch) => {
+                    mailboxes_changed = ch.has_more_changes()
+                        || ch.total_changes() > 0
+                        || ch.old_state() != ch.new_state();
+                    new_states.mailbox_state = Some(ch.new_state().to_string());
+                }
+                None => {
+                    mailboxes_changed = true;
+                    new_states.mailbox_state = None;
+                }
+            }
+        }
+
+        if requested_email {
+            match responses.next().and_then(|r| r.unwrap_changes_email().ok()) {
+                Some(ch) => {
+                    emails_changed = ch.has_more_changes()
+                        || ch.total_changes() > 0
+                        || ch.old_state() != ch.new_state();
+                    new_states.email_state = Some(ch.new_state().to_string());
+                }
+                None => {
+                    emails_changed = true;
+                    new_states.email_state = None;
+                }
+            }
+        }
+
+        if requested_thread {
+            match responses
+                .next()
+                .and_then(|r| r.unwrap_changes_thread().ok())
+            {
+                Some(ch) => {
+                    threads_changed = ch.has_more_changes()
+                        || ch.total_changes() > 0
+                        || ch.old_state() != ch.new_state();
+                    for id in ch
+                        .created()
+                        .iter()
+                        .chain(ch.updated())
+                        .chain(ch.destroyed())
+                    {
+                        invalidated_threads.push(ThreadId(id.clone()));
+                    }
+                    new_states.thread_state = Some(ch.new_state().to_string());
+                }
+                None => {
+                    threads_changed = true;
+                    new_states.thread_state = None;
+                }
+            }
+        }
+
+        Ok(ChangesCheck {
+            mailboxes_changed,
+            emails_changed,
+            threads_changed,
+            invalidated_threads,
+            new_states,
+        })
     }
 
     /// Fetch all messages in a thread with text & HTML body values in a single
