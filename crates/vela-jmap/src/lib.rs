@@ -23,7 +23,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 /// Maximum inline blob size fetched automatically (10 MiB).
 const MAX_INLINE_BLOB_BYTES: usize = 10 * 1024 * 1024;
 /// Maximum explicit attachment download size (50 MiB).
-const MAX_ATTACHMENT_BYTES: usize = 50 * 1024 * 1024;
+pub const MAX_ATTACHMENT_BYTES: usize = 50 * 1024 * 1024;
 
 /// Authentication credentials kept in memory and wiped on drop.
 ///
@@ -130,6 +130,7 @@ impl fmt::Debug for JmapSession {
 impl JmapSession {
     /// Discover the JMAP session (`/.well-known/jmap`) and authenticate.
     pub async fn connect(config: &JmapConfig) -> Result<Self, VelaError> {
+        validate_server_url(&config.server_url)?;
         let mut builder = jmap_client::client::Client::new();
         if let Some(host) = extract_host(&config.server_url) {
             builder = builder.follow_redirects([host]);
@@ -726,4 +727,45 @@ fn quick_has_remote_images(html: &str) -> bool {
         || lower.contains("src='https://")
         || lower.contains("url(http://")
         || lower.contains("url(https://")
+}
+
+/// Require `https://` for remote JMAP servers so credentials are never sent in
+/// cleartext; allow `http://` only for loopback hosts during local testing.
+pub fn validate_server_url(url: &str) -> Result<(), VelaError> {
+    let trimmed = url.trim();
+    if trimmed.starts_with("https://") {
+        let host = extract_host(trimmed).unwrap_or_default();
+        if host.is_empty() {
+            return Err(VelaError::Auth("Server URL is missing a host".into()));
+        }
+        return Ok(());
+    }
+    if trimmed.starts_with("http://") {
+        let host = extract_host(trimmed).unwrap_or_default();
+        if matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1" | "[::1]") {
+            return Ok(());
+        }
+        return Err(VelaError::Auth(
+            "Refusing insecure http:// JMAP server URL; use https:// (http:// is only allowed for localhost)".into(),
+        ));
+    }
+    Err(VelaError::Auth(
+        "JMAP server URL must start with https://".into(),
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_server_url;
+
+    #[test]
+    fn validates_jmap_server_url_scheme() {
+        assert!(validate_server_url("https://mail.example.com").is_ok());
+        assert!(validate_server_url("https://api.fastmail.com/jmap/session").is_ok());
+        assert!(validate_server_url("http://localhost:8080").is_ok());
+        assert!(validate_server_url("http://127.0.0.1:8080").is_ok());
+        assert!(validate_server_url("http://mail.example.com").is_err());
+        assert!(validate_server_url("ftp://mail.example.com").is_err());
+        assert!(validate_server_url("https://").is_err());
+    }
 }

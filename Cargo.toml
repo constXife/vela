@@ -21,7 +21,7 @@ dirs = "6"
 jiff = { version = "0.2", features = ["serde"] }
 jmap-client = { version = "0.3", default-features = false, features = ["async", "websockets"] }
 oo7 = { version = "0.4", default-features = false, features = ["tokio", "native_crypto"] }
-# Enable OS trust store roots in reqwest so private CAs (e.g. ca.example.com)
+# Enable OS trust store roots in reqwest so private/custom CAs
 # work with full TLS verification inside jmap-client.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots"] }
 rusqlite = { version = "0.32", features = ["bundled-sqlcipher"] }

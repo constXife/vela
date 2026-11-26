@@ -4,9 +4,9 @@
 //! secret storage (`org.freedesktop.secrets` via `oo7`).
 
 use std::collections::HashMap;
-use std::fs;
-use std::io::Read;
-use std::os::unix::fs::PermissionsExt;
+use std::fs::{self, OpenOptions};
+use std::io::{Read, Write};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -187,7 +187,14 @@ pub fn save_accounts_config(cfg: &AccountsConfig) -> Result<(), VelaError> {
     let serialized = toml::to_string_pretty(cfg)
         .map_err(|err| VelaError::Other(format!("failed to serialize config: {err}")))?;
     let tmp = path.with_extension("toml.tmp");
-    fs::write(&tmp, serialized)
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&tmp)
+        .map_err(|err| VelaError::Other(format!("failed to open {}: {err}", tmp.display())))?;
+    file.write_all(serialized.as_bytes())
         .map_err(|err| VelaError::Other(format!("failed to write {}: {err}", tmp.display())))?;
     fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600)).map_err(|err| {
         VelaError::Other(format!(
@@ -426,13 +433,13 @@ mod tests {
     fn migrates_legacy_single_account_config() {
         let legacy = r#"
 server_url = "https://mail.example.com"
-username = "constxife"
+username = "alice"
 auth_kind = "basic"
 "#;
         let parsed = parse_accounts_config(legacy).unwrap();
         assert_eq!(parsed.accounts.len(), 1);
-        assert_eq!(parsed.active().unwrap().username, "constxife");
-        assert_eq!(parsed.active().unwrap().id, "constxife_yogg_rlyeh_void");
+        assert_eq!(parsed.active().unwrap().username, "alice");
+        assert_eq!(parsed.active().unwrap().id, "alice_mail_example_com");
     }
 
     #[test]

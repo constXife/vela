@@ -36,7 +36,7 @@ use zeroize::Zeroize;
 const WINDOW_SIZE: Size = Size::new(1280.0, 760.0);
 const WINDOW_MIN: Size = Size::new(960.0, 600.0);
 const INITIAL_THREAD_LIMIT: usize = 50;
-const DEFAULT_SERVER_URL: &str = "https://mail.example.com";
+const DEFAULT_SERVER_URL: &str = "";
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
@@ -1374,6 +1374,13 @@ impl cosmic::Application for App {
                 self.dispatch(InboxEvent::ReportError(format!("Sync failed: {err}")))
             }
             Message::DownloadAttachment(attachment) => {
+                if attachment.size > vela_jmap::MAX_ATTACHMENT_BYTES as u64 {
+                    return self.dispatch(InboxEvent::ReportError(format!(
+                        "Attachment is too large ({}, limit {})",
+                        format_file_size(attachment.size),
+                        format_file_size(vela_jmap::MAX_ATTACHMENT_BYTES as u64),
+                    )));
+                }
                 if !self.downloading_blobs.insert(attachment.blob_id.clone()) {
                     return Task::none();
                 }
@@ -3700,31 +3707,45 @@ fn save_to_downloads(raw_name: &str, bytes: &[u8]) -> Result<PathBuf, String> {
     };
 
     let candidate = base_dir.join(safe_name);
-    let dest = if !candidate.exists() {
-        candidate
-    } else {
-        let stem = candidate
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("attachment");
-        let ext = candidate.extension().and_then(|e| e.to_str());
-        let mut chosen = None;
-        for n in 1..1000 {
-            let numbered = match ext {
-                Some(ext) => format!("{stem} ({n}).{ext}"),
-                None => format!("{stem} ({n})"),
-            };
-            let path = base_dir.join(numbered);
-            if !path.exists() {
-                chosen = Some(path);
-                break;
-            }
-        }
-        chosen.ok_or_else(|| "too many duplicate attachment files".to_string())?
-    };
+    let stem = candidate
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("attachment")
+        .to_string();
+    let ext = candidate
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_string);
 
-    std::fs::write(&dest, bytes).map_err(|e| e.to_string())?;
-    Ok(dest)
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    for attempt in 0..1000u32 {
+        let dest = if attempt == 0 {
+            candidate.clone()
+        } else {
+            let numbered = match &ext {
+                Some(ext) => format!("{stem} ({attempt}).{ext}"),
+                None => format!("{stem} ({attempt})"),
+            };
+            base_dir.join(numbered)
+        };
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&dest)
+        {
+            Ok(mut file) => {
+                file.write_all(bytes).map_err(|e| e.to_string())?;
+                return Ok(dest);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err.to_string()),
+        }
+    }
+
+    Err("too many duplicate attachment files".to_string())
 }
 
 fn shortcut_section<'a>(title: &'a str, entries: &[(&'a str, &'a str)]) -> Element<'a, Message> {
