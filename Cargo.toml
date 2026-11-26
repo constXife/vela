@@ -46,3 +46,7 @@ vela-core = { path = "crates/vela-core" }
 vela-cache = { path = "crates/vela-cache" }
 vela-jmap = { path = "crates/vela-jmap" }
 vela-flows = { path = "crates/vela-flows" }
+
+[profile.release]
+lto = "thin"
+strip = true
