@@ -98,9 +98,14 @@ struct Backend {
 
 impl Backend {
     async fn connect() -> Self {
+        let account_id = store::load_account_config().ok().flatten().map(|a| a.id);
         let cache = match store::load_or_create_cache_key().await {
             Ok(key) => tokio::task::spawn_blocking(move || {
-                VelaCache::open_default(&key).ok().map(Arc::new)
+                let opened = match account_id {
+                    Some(id) => VelaCache::open_for_account(&id, &key),
+                    None => VelaCache::open_default(&key),
+                };
+                opened.ok().map(Arc::new)
             })
             .await
             .ok()

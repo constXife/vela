@@ -112,7 +112,8 @@ struct App {
     inbox: InboxState,
     session: Option<Arc<JmapSession>>,
     cache: Option<Arc<VelaCache>>,
-    account: Option<(String, String)>,
+    accounts: Vec<store::AccountConfig>,
+    active_account_id: Option<String>,
     syncing: bool,
     sync_states: SyncStates,
     downloading_blobs: HashSet<BlobId>,
@@ -120,10 +121,11 @@ struct App {
     show_shortcuts: bool,
 }
 
-type ConnectedAccount = (Arc<JmapSession>, Vec<Mailbox>, String);
+type ConnectedAccount = (String, Arc<JmapSession>, Vec<Mailbox>, String);
 
 #[derive(Clone, Debug)]
 struct CachedSnapshot {
+    account_id: String,
     cache: Arc<VelaCache>,
     mailboxes: Vec<Mailbox>,
     mailbox_id: Option<MailboxId>,
@@ -135,7 +137,10 @@ struct CachedSnapshot {
 #[derive(Clone, Debug)]
 enum Message {
     CacheWarmed(Option<Box<CachedSnapshot>>),
-    CacheReady(Option<Arc<VelaCache>>),
+    CacheReady {
+        account_id: String,
+        cache: Option<Arc<VelaCache>>,
+    },
     StartupResolved(Result<Option<ConnectedAccount>, String>),
     ServerUrlChanged(String),
     UsernameChanged(String),
@@ -143,8 +148,11 @@ enum Message {
     SubmitConnect,
     ConnectFinished(Result<ConnectedAccount, String>),
     OpenSampleMode,
+    OpenAddAccount,
+    CancelAddAccount,
+    SwitchAccount(String),
     SignOut,
-    SignedOut,
+    SignedOut(Option<String>),
     SelectMailbox(MailboxId),
     ThreadsLoaded {
         op_id: vela_flows::OpId,
@@ -191,6 +199,12 @@ enum Message {
 }
 
 impl App {
+    fn refresh_accounts_from_disk(&mut self) {
+        if let Ok(cfg) = store::load_accounts_config() {
+            self.accounts = cfg.accounts;
+        }
+    }
+
     fn dispatch(&mut self, event: InboxEvent) -> Task<Message> {
         let effects = self.inbox.handle(event);
         let mut tasks = Vec::new();
@@ -389,19 +403,22 @@ impl cosmic::Application for App {
     }
 
     fn init(core: Core, flags: Self::Flags) -> (Self, Task<Self::Message>) {
-        let initial_account = if flags.sample_mode {
-            None
+        let accounts_cfg = if flags.sample_mode {
+            store::AccountsConfig::default()
         } else {
-            current_account_display()
+            store::load_accounts_config().unwrap_or_default()
         };
+        let active_id = accounts_cfg.active().map(|a| a.id.clone());
+
         let mut app = Self {
             core,
             screen: Screen::Starting,
             inbox: InboxState::new(),
             session: None,
             cache: None,
-            account: initial_account,
-            syncing: !flags.sample_mode,
+            accounts: accounts_cfg.accounts,
+            active_account_id: active_id.clone(),
+            syncing: !flags.sample_mode && active_id.is_some(),
             sync_states: SyncStates::default(),
             downloading_blobs: HashSet::new(),
             last_saved_attachment: None,
@@ -414,68 +431,13 @@ impl cosmic::Application for App {
             return (app, task);
         }
 
-        let warm_cache_task = cosmic::task::future(async move {
-            let has_account = store::load_account_config().ok().flatten().is_some();
-            if !has_account {
-                return Message::CacheWarmed(None);
-            }
-            let Ok(key) = store::load_or_create_cache_key().await else {
-                return Message::CacheWarmed(None);
-            };
-            let snap = tokio::task::spawn_blocking(move || {
-                let cache = Arc::new(VelaCache::open_default(&key).ok()?);
-                let mailboxes = cache.load_mailboxes().ok().unwrap_or_default();
-                let initial_mb = mailboxes
-                    .iter()
-                    .find(|m| m.role == MailboxRole::Inbox)
-                    .or_else(|| mailboxes.first())
-                    .map(|m| m.id.clone());
-                let threads = initial_mb
-                    .as_ref()
-                    .and_then(|id| cache.load_threads(id).ok())
-                    .unwrap_or_default();
-                let conversation = threads.first().and_then(|t| {
-                    cache
-                        .load_conversation(&t.id)
-                        .ok()
-                        .flatten()
-                        .map(|msgs| (t.id.clone(), msgs))
-                });
-                let sync_states = SyncStates {
-                    mailbox_state: cache.get_sync_state("mailbox_state").ok().flatten(),
-                    email_state: cache.get_sync_state("email_state").ok().flatten(),
-                    thread_state: cache.get_sync_state("thread_state").ok().flatten(),
-                };
-                Some(Box::new(CachedSnapshot {
-                    cache,
-                    mailboxes,
-                    mailbox_id: initial_mb,
-                    threads,
-                    conversation,
-                    sync_states,
-                }))
-            })
-            .await
-            .ok()
-            .flatten();
-            Message::CacheWarmed(snap)
-        });
-
-        let connect_task = cosmic::task::future(async move {
-            let result = async {
-                let Some(config) = store::load_saved_jmap_config().await? else {
-                    return Ok(None);
-                };
-                let session = Arc::new(JmapSession::connect(&config).await?);
-                let (mailboxes, mb_state) = session.list_mailboxes_with_state().await?;
-                Ok::<_, vela_core::VelaError>(Some((session, mailboxes, mb_state)))
-            }
-            .await
-            .map_err(|e| e.to_string());
-            Message::StartupResolved(result)
-        });
-
-        (app, Task::batch([warm_cache_task, connect_task]))
+        if let Some(account_id) = active_id {
+            let task = spawn_account_load_tasks(account_id);
+            (app, task)
+        } else {
+            app.screen = Screen::Connect(ConnectForm::from_saved_or_default());
+            (app, Task::none())
+        }
     }
 
     fn subscription(&self) -> Subscription<Self::Message> {
@@ -520,6 +482,9 @@ impl cosmic::Application for App {
     fn update(&mut self, message: Self::Message) -> Task<Self::Message> {
         match message {
             Message::CacheWarmed(Some(snap)) => {
+                if self.active_account_id.as_deref() != Some(snap.account_id.as_str()) {
+                    return Task::none();
+                }
                 self.cache = Some(snap.cache);
                 if self.sync_states.mailbox_state.is_none() {
                     self.sync_states.mailbox_state = snap.sync_states.mailbox_state;
@@ -545,7 +510,10 @@ impl cosmic::Application for App {
                 Task::none()
             }
             Message::CacheWarmed(None) => Task::none(),
-            Message::CacheReady(cache) => {
+            Message::CacheReady { account_id, cache } => {
+                if self.active_account_id.as_deref() != Some(account_id.as_str()) {
+                    return Task::none();
+                }
                 if let Some(cache) = cache {
                     if !self.inbox.mailboxes.is_empty() {
                         let c = cache.clone();
@@ -560,7 +528,10 @@ impl cosmic::Application for App {
                 }
                 Task::none()
             }
-            Message::StartupResolved(Ok(Some((session, mailboxes, mb_state)))) => {
+            Message::StartupResolved(Ok(Some((account_id, session, mailboxes, mb_state)))) => {
+                if self.active_account_id.as_deref() != Some(account_id.as_str()) {
+                    return Task::none();
+                }
                 self.sync_states.mailbox_state = Some(mb_state);
                 if let Some(cache) = self.cache.clone() {
                     let mbs = mailboxes.clone();
@@ -571,14 +542,13 @@ impl cosmic::Application for App {
                     });
                 }
                 self.session = Some(session);
-                self.account = current_account_display();
+                self.refresh_accounts_from_disk();
                 self.syncing = false;
                 self.screen = Screen::Inbox;
                 self.dispatch(InboxEvent::MailboxesLoaded(mailboxes))
             }
             Message::StartupResolved(Ok(None)) => {
                 self.syncing = false;
-                self.account = None;
                 self.screen = Screen::Connect(ConnectForm::from_saved_or_default());
                 Task::none()
             }
@@ -637,52 +607,47 @@ impl cosmic::Application for App {
                     let result = async {
                         let session = Arc::new(JmapSession::connect(&config).await?);
                         let (mailboxes, mb_state) = session.list_mailboxes_with_state().await?;
-                        store::save_jmap_config(&config).await?;
-                        Ok::<_, vela_core::VelaError>((session, mailboxes, mb_state))
+                        let saved = store::save_jmap_config(&config).await?;
+                        Ok::<_, vela_core::VelaError>((saved.id, session, mailboxes, mb_state))
                     }
                     .await
                     .map_err(|e| e.to_string());
                     Message::ConnectFinished(result)
                 })
             }
-            Message::ConnectFinished(Ok((session, mailboxes, mb_state))) => {
+            Message::ConnectFinished(Ok((account_id, session, mailboxes, mb_state))) => {
                 if let Screen::Connect(form) = &mut self.screen {
                     form.wipe_password();
                 }
+                self.refresh_accounts_from_disk();
+                self.active_account_id = Some(account_id.clone());
                 self.sync_states = SyncStates {
                     mailbox_state: Some(mb_state),
                     email_state: None,
                     thread_state: None,
                 };
-                if let Some(cache) = self.cache.clone() {
-                    let mbs = mailboxes.clone();
-                    let states = self.sync_states.clone();
-                    tokio::task::spawn_blocking(move || {
-                        let _ = cache.save_mailboxes(&mbs);
-                        persist_sync_states(&cache, &states);
-                    });
-                }
                 self.session = Some(session);
-                self.account = current_account_display();
+                self.cache = None;
                 self.syncing = false;
                 self.inbox = InboxState::new();
                 self.screen = Screen::Inbox;
-                let open_cache_task = if self.cache.is_none() {
-                    cosmic::task::future(async move {
-                        let cache = match store::load_or_create_cache_key().await {
-                            Ok(key) => tokio::task::spawn_blocking(move || {
-                                VelaCache::open_default(&key).ok().map(Arc::new)
-                            })
-                            .await
-                            .ok()
-                            .flatten(),
-                            Err(_) => None,
-                        };
-                        Message::CacheReady(cache)
-                    })
-                } else {
-                    Task::none()
-                };
+                let aid = account_id.clone();
+                let open_cache_task = cosmic::task::future(async move {
+                    let cache = match store::load_or_create_cache_key_for(&aid).await {
+                        Ok(key) => tokio::task::spawn_blocking({
+                            let aid = aid.clone();
+                            move || VelaCache::open_for_account(&aid, &key).ok().map(Arc::new)
+                        })
+                        .await
+                        .ok()
+                        .flatten(),
+                        Err(_) => None,
+                    };
+                    Message::CacheReady {
+                        account_id: aid,
+                        cache,
+                    }
+                });
                 Task::batch([
                     open_cache_task,
                     self.dispatch(InboxEvent::MailboxesLoaded(mailboxes)),
@@ -701,30 +666,83 @@ impl cosmic::Application for App {
                 }
                 self.session = None;
                 self.cache = None;
-                self.account = None;
+                self.active_account_id = None;
                 self.syncing = false;
                 self.sync_states = SyncStates::default();
                 self.inbox = InboxState::new();
                 self.screen = Screen::Inbox;
                 self.dispatch(InboxEvent::MailboxesLoaded(sample::mailboxes()))
             }
-            Message::SignOut => {
+            Message::OpenAddAccount => {
+                self.screen = Screen::Connect(ConnectForm {
+                    server_url: DEFAULT_SERVER_URL.to_string(),
+                    username: String::new(),
+                    password: String::new(),
+                    connecting: false,
+                    error: None,
+                });
+                Task::none()
+            }
+            Message::CancelAddAccount => {
+                if let Screen::Connect(form) = &mut self.screen {
+                    form.wipe_password();
+                }
+                self.screen = Screen::Inbox;
+                Task::none()
+            }
+            Message::SwitchAccount(account_id) => {
+                if self.active_account_id.as_deref() == Some(account_id.as_str())
+                    && self.session.is_some()
+                {
+                    return Task::none();
+                }
+                let _ = store::set_active_account(&account_id);
+                self.active_account_id = Some(account_id.clone());
                 self.session = None;
                 self.cache = None;
-                self.account = None;
+                self.syncing = true;
+                self.sync_states = SyncStates::default();
+                self.inbox = InboxState::new();
+                self.screen = Screen::Inbox;
+                spawn_account_load_tasks(account_id)
+            }
+            Message::SignOut => {
+                let removing = self.active_account_id.take();
+                self.session = None;
+                self.cache = None;
                 self.syncing = false;
                 self.sync_states = SyncStates::default();
                 self.inbox = InboxState::new();
                 cosmic::task::future(async move {
-                    let _ = store::clear_saved_secret().await;
-                    let _ = store::clear_cache_key().await;
-                    let _ = tokio::task::spawn_blocking(vela_cache::destroy_default_cache).await;
-                    Message::SignedOut
+                    let next_active = if let Some(account_id) = removing {
+                        let next = store::remove_account(&account_id).await.ok().flatten();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            vela_cache::destroy_account_cache(&account_id)
+                        })
+                        .await;
+                        next
+                    } else {
+                        let _ = store::clear_saved_secret().await;
+                        let _ = store::clear_cache_key().await;
+                        let _ =
+                            tokio::task::spawn_blocking(vela_cache::destroy_default_cache).await;
+                        None
+                    };
+                    Message::SignedOut(next_active)
                 })
             }
-            Message::SignedOut => {
-                self.screen = Screen::Connect(ConnectForm::from_saved_or_default());
-                Task::none()
+            Message::SignedOut(next_account_id) => {
+                self.refresh_accounts_from_disk();
+                if let Some(next_id) = next_account_id {
+                    self.active_account_id = Some(next_id.clone());
+                    self.syncing = true;
+                    self.screen = Screen::Inbox;
+                    spawn_account_load_tasks(next_id)
+                } else {
+                    self.active_account_id = None;
+                    self.screen = Screen::Connect(ConnectForm::from_saved_or_default());
+                    Task::none()
+                }
             }
             Message::SelectMailbox(id) => self.dispatch(InboxEvent::SelectMailbox(id)),
             Message::ThreadsLoaded {
@@ -1055,9 +1073,15 @@ impl App {
             connect_btn = connect_btn.on_press(Message::SubmitConnect);
         }
 
+        let secondary_action = if !self.accounts.is_empty() {
+            widget::button::text("Cancel").on_press(Message::CancelAddAccount)
+        } else {
+            widget::button::text("Preview sample data").on_press(Message::OpenSampleMode)
+        };
+
         let actions = widget::row::with_capacity(2)
             .push(connect_btn)
-            .push(widget::button::text("Preview sample data").on_press(Message::OpenSampleMode))
+            .push(secondary_action)
             .spacing(12)
             .align_y(Alignment::Center);
 
@@ -1175,47 +1199,62 @@ impl App {
             list = list.push(btn);
         }
 
-        let footer_label = if self.session.is_some() || self.account.is_some() {
-            "Sign out"
+        let mut footer_col = widget::column::with_capacity(self.accounts.len() + 2).spacing(4);
+        if !self.accounts.is_empty() {
+            for acc in &self.accounts {
+                let is_active = self.active_account_id.as_deref() == Some(acc.id.as_str());
+                let sub = if is_active && is_syncing {
+                    "Syncing…".to_string()
+                } else {
+                    acc.host()
+                };
+                let item = widget::column::with_capacity(2)
+                    .spacing(1)
+                    .push(
+                        widget::text::caption(html::clean_snippet(&acc.username, 22))
+                            .class(cosmic::theme::Text::Custom(primary_text_style)),
+                    )
+                    .push(
+                        widget::text::caption(html::clean_snippet(&sub, 22))
+                            .class(cosmic::theme::Text::Custom(muted_text_style)),
+                    );
+                let acc_btn = widget::button::custom(item)
+                    .class(cosmic::theme::Button::ListItem([6.0; 4]))
+                    .selected(is_active)
+                    .padding([6, 8])
+                    .width(Length::Fill)
+                    .on_press(Message::SwitchAccount(acc.id.clone()));
+                footer_col = footer_col.push(acc_btn);
+            }
+
+            let footer_actions = widget::row::with_capacity(3)
+                .spacing(4)
+                .align_y(Alignment::Center)
+                .push(widget::tooltip(
+                    widget::button::icon(widget::icon::from_name("list-add-symbolic"))
+                        .padding(6)
+                        .on_press(Message::OpenAddAccount),
+                    widget::text::caption("Add JMAP account"),
+                    widget::tooltip::Position::Top,
+                ))
+                .push(widget::space::horizontal())
+                .push(widget::button::text("Sign out").on_press(Message::SignOut));
+            footer_col = footer_col.push(footer_actions);
         } else {
-            "Sign in…"
-        };
-        let mut footer_col = widget::column::with_capacity(3).spacing(2);
-        if let Some((user, host)) = &self.account {
-            let sub = if is_syncing {
-                "Syncing…".to_string()
-            } else {
-                host.clone()
-            };
-            footer_col = footer_col.push(
-                widget::container(
-                    widget::column::with_capacity(2)
-                        .spacing(1)
-                        .push(
-                            widget::text::caption(html::clean_snippet(user, 24))
-                                .class(cosmic::theme::Text::Custom(primary_text_style)),
-                        )
-                        .push(
-                            widget::text::caption(html::clean_snippet(&sub, 24))
-                                .class(cosmic::theme::Text::Custom(muted_text_style)),
-                        ),
+            footer_col = footer_col
+                .push(
+                    widget::container(
+                        widget::text::caption("Sample mode")
+                            .class(cosmic::theme::Text::Custom(muted_text_style)),
+                    )
+                    .padding([0, 10]),
                 )
-                .padding([4, 10, 4, 10]),
-            );
-        } else {
-            footer_col = footer_col.push(
-                widget::container(
-                    widget::text::caption("Sample mode")
-                        .class(cosmic::theme::Text::Custom(muted_text_style)),
-                )
-                .padding([0, 10]),
-            );
+                .push(
+                    widget::button::text("Sign in…")
+                        .width(Length::Fill)
+                        .on_press(Message::OpenAddAccount),
+                );
         }
-        footer_col = footer_col.push(
-            widget::button::text(footer_label)
-                .width(Length::Fill)
-                .on_press(Message::SignOut),
-        );
 
         let sidebar = widget::column::with_capacity(5)
             .push(header)
@@ -1888,16 +1927,68 @@ fn persist_sync_states(cache: &VelaCache, states: &SyncStates) {
     }
 }
 
-fn current_account_display() -> Option<(String, String)> {
-    let cfg = store::load_account_config().ok().flatten()?;
-    let host = cfg
-        .server_url
-        .trim()
-        .trim_start_matches("https://")
-        .trim_start_matches("http://")
-        .trim_end_matches('/')
-        .to_string();
-    Some((cfg.username, host))
+fn spawn_account_load_tasks(account_id: String) -> Task<Message> {
+    let warm_id = account_id.clone();
+    let warm_cache_task = cosmic::task::future(async move {
+        let Ok(key) = store::load_or_create_cache_key_for(&warm_id).await else {
+            return Message::CacheWarmed(None);
+        };
+        let snap = tokio::task::spawn_blocking(move || {
+            let cache = Arc::new(VelaCache::open_for_account(&warm_id, &key).ok()?);
+            let mailboxes = cache.load_mailboxes().ok().unwrap_or_default();
+            let initial_mb = mailboxes
+                .iter()
+                .find(|m| m.role == MailboxRole::Inbox)
+                .or_else(|| mailboxes.first())
+                .map(|m| m.id.clone());
+            let threads = initial_mb
+                .as_ref()
+                .and_then(|id| cache.load_threads(id).ok())
+                .unwrap_or_default();
+            let conversation = threads.first().and_then(|t| {
+                cache
+                    .load_conversation(&t.id)
+                    .ok()
+                    .flatten()
+                    .map(|msgs| (t.id.clone(), msgs))
+            });
+            let sync_states = SyncStates {
+                mailbox_state: cache.get_sync_state("mailbox_state").ok().flatten(),
+                email_state: cache.get_sync_state("email_state").ok().flatten(),
+                thread_state: cache.get_sync_state("thread_state").ok().flatten(),
+            };
+            Some(Box::new(CachedSnapshot {
+                account_id: warm_id,
+                cache,
+                mailboxes,
+                mailbox_id: initial_mb,
+                threads,
+                conversation,
+                sync_states,
+            }))
+        })
+        .await
+        .ok()
+        .flatten();
+        Message::CacheWarmed(snap)
+    });
+
+    let connect_id = account_id;
+    let connect_task = cosmic::task::future(async move {
+        let result = async {
+            let Some(config) = store::load_jmap_config_for(&connect_id).await? else {
+                return Ok(None);
+            };
+            let session = Arc::new(JmapSession::connect(&config).await?);
+            let (mailboxes, mb_state) = session.list_mailboxes_with_state().await?;
+            Ok::<_, vela_core::VelaError>(Some((connect_id, session, mailboxes, mb_state)))
+        }
+        .await
+        .map_err(|e| e.to_string());
+        Message::StartupResolved(result)
+    });
+
+    Task::batch([warm_cache_task, connect_task])
 }
 
 fn search_input_id() -> widget::Id {

@@ -42,9 +42,38 @@ pub fn default_cache_path() -> Result<PathBuf, VelaError> {
     Ok(base.join("vela").join("cache.db"))
 }
 
+/// Per-account cache database path (`~/.cache/vela/cache-<safe_id>.db`).
+pub fn cache_path_for_account(account_id: &str) -> Result<PathBuf, VelaError> {
+    let base = dirs::cache_dir()
+        .ok_or_else(|| VelaError::Other("unable to determine XDG cache directory".into()))?;
+    let safe_id: String = account_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let safe_id = if safe_id.is_empty() {
+        "default".to_string()
+    } else {
+        safe_id
+    };
+    Ok(base.join("vela").join(format!("cache-{safe_id}.db")))
+}
+
 /// Remove the default cache database and its WAL/SHM sidecar files (used on Sign out).
 pub fn destroy_default_cache() -> Result<(), VelaError> {
     let path = default_cache_path()?;
+    remove_db_files(&path);
+    Ok(())
+}
+
+/// Remove a specific account's cache database and its WAL/SHM sidecar files.
+pub fn destroy_account_cache(account_id: &str) -> Result<(), VelaError> {
+    let path = cache_path_for_account(account_id)?;
     remove_db_files(&path);
     Ok(())
 }
@@ -53,6 +82,12 @@ impl VelaCache {
     /// Open or create the encrypted cache at `~/.cache/vela/cache.db`.
     pub fn open_default(hex_key: &str) -> Result<Self, VelaError> {
         let path = default_cache_path()?;
+        Self::open_at(path, hex_key)
+    }
+
+    /// Open or create an encrypted per-account cache at `~/.cache/vela/cache-<id>.db`.
+    pub fn open_for_account(account_id: &str, hex_key: &str) -> Result<Self, VelaError> {
+        let path = cache_path_for_account(account_id)?;
         Self::open_at(path, hex_key)
     }
 
