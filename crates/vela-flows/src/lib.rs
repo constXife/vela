@@ -138,17 +138,85 @@ impl InboxState {
             .unwrap_or(RemoteImagePolicy::Block)
     }
 
+    /// Seed the UI state from the local encrypted cache on cold start so the
+    /// user sees mailboxes and messages before the JMAP network handshake ends.
+    pub fn hydrate_from_cache(
+        &mut self,
+        mailboxes: Vec<Mailbox>,
+        mailbox_id: Option<MailboxId>,
+        threads: Vec<ThreadSummary>,
+        conversation: Option<(ThreadId, Vec<Message>)>,
+    ) {
+        if mailboxes.is_empty() {
+            return;
+        }
+        self.mailboxes = mailboxes;
+        self.selected_mailbox = mailbox_id.or_else(|| {
+            self.mailbox_by_role(MailboxRole::Inbox)
+                .or_else(|| self.mailboxes.first())
+                .map(|m| m.id.clone())
+        });
+        self.threads = threads;
+        self.loading_threads = false;
+        if let Some((tid, messages)) = conversation {
+            self.cache_conversation(tid.clone(), messages.clone());
+            self.selected_thread = Some(tid);
+            self.conversation = messages;
+            self.loading_conversation = false;
+        } else if let Some(first) = self.threads.first() {
+            self.selected_thread = Some(first.id.clone());
+        }
+    }
+
+    /// Populate threads from the local cache immediately when switching mailboxes,
+    /// keeping `active_mailbox_op` intact so the live JMAP refresh still reconciles.
+    pub fn apply_cached_threads(
+        &mut self,
+        mailbox_id: &MailboxId,
+        threads: Vec<ThreadSummary>,
+        first_conversation: Option<(ThreadId, Vec<Message>)>,
+    ) {
+        if self.selected_mailbox.as_ref() != Some(mailbox_id) || threads.is_empty() {
+            return;
+        }
+        self.threads = threads;
+        self.loading_threads = false;
+        if let Some((tid, messages)) = first_conversation {
+            self.cache_conversation(tid.clone(), messages.clone());
+            self.selected_thread = Some(tid);
+            self.conversation = messages;
+            self.loading_conversation = false;
+        } else if let Some(first) = self.threads.first() {
+            self.selected_thread = Some(first.id.clone());
+        }
+    }
+
     pub fn handle(&mut self, event: InboxEvent) -> Vec<InboxEffect> {
         match event {
             InboxEvent::MailboxesLoaded(mailboxes) => {
                 self.mailboxes = mailboxes;
-                if self.selected_mailbox.is_none()
-                    && let Some(initial) = self
-                        .mailbox_by_role(MailboxRole::Inbox)
-                        .or_else(|| self.mailboxes.first())
-                {
-                    let id = initial.id.clone();
-                    return self.select_mailbox(id);
+                let target = self
+                    .selected_mailbox
+                    .as_ref()
+                    .filter(|id| self.mailboxes.iter().any(|m| &m.id == *id))
+                    .cloned()
+                    .or_else(|| {
+                        self.mailbox_by_role(MailboxRole::Inbox)
+                            .or_else(|| self.mailboxes.first())
+                            .map(|m| m.id.clone())
+                    });
+                if let Some(id) = target {
+                    // Preserve already-hydrated threads on screen while refreshing live.
+                    let op_id = self.alloc_op();
+                    self.selected_mailbox = Some(id.clone());
+                    self.active_mailbox_op = Some(op_id);
+                    if self.threads.is_empty() {
+                        self.loading_threads = true;
+                    }
+                    return vec![InboxEffect::LoadThreads {
+                        op_id,
+                        mailbox_id: id,
+                    }];
                 }
                 Vec::new()
             }
@@ -165,9 +233,20 @@ impl InboxState {
                 }
                 self.loading_threads = false;
                 self.threads = threads;
+                self.prefetching_threads.clear();
+                let keep_id = self
+                    .selected_thread
+                    .as_ref()
+                    .filter(|id| self.threads.iter().any(|t| &t.id == *id))
+                    .cloned();
+                if let Some(id) = keep_id {
+                    let idx = self.threads.iter().position(|t| t.id == id).unwrap_or(0);
+                    let mut effects = self.select_thread(id);
+                    effects.extend(self.prefetch_around(idx, INITIAL_PREFETCH_COUNT));
+                    return effects;
+                }
                 self.selected_thread = None;
                 self.conversation.clear();
-                self.prefetching_threads.clear();
                 if let Some(first) = self.threads.first() {
                     let id = first.id.clone();
                     let mut effects = self.select_thread(id);

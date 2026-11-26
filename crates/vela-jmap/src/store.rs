@@ -5,16 +5,19 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use vela_core::VelaError;
+use zeroize::Zeroizing;
 
 use crate::{JmapConfig, JmapCredentials};
 
 const KEYRING_APP_ID: &str = "com.rlyeh.vela.Cosmic";
 const KEYRING_LABEL: &str = "Vela JMAP Account";
+const CACHE_KEY_LABEL: &str = "Vela Local Cache Key";
 
 /// Non-secret account metadata stored on disk in `config.toml` (`0600`).
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -171,4 +174,69 @@ pub async fn clear_saved_secret() -> Result<(), VelaError> {
         .await
         .map_err(|err| VelaError::Auth(format!("failed to clear keyring secret: {err}")))?;
     Ok(())
+}
+
+fn cache_key_attributes() -> HashMap<&'static str, &'static str> {
+    HashMap::from([
+        ("application", KEYRING_APP_ID),
+        ("kind", "sqlcipher_cache_key"),
+    ])
+}
+
+/// Load the 256-bit hex encryption key for `cache.db` from the OS Keyring,
+/// generating and persisting a fresh random key on first run.
+pub async fn load_or_create_cache_key() -> Result<Zeroizing<String>, VelaError> {
+    let keyring = oo7::Keyring::new()
+        .await
+        .map_err(|err| VelaError::Auth(format!("OS keyring unavailable: {err}")))?;
+    let attrs = cache_key_attributes();
+    let items = keyring
+        .search_items(&attrs)
+        .await
+        .map_err(|err| VelaError::Auth(format!("keyring cache-key lookup failed: {err}")))?;
+
+    if let Some(item) = items.into_iter().next()
+        && let Ok(secret_bytes) = item.secret().await
+        && let Ok(existing) = String::from_utf8(secret_bytes.to_vec())
+        && existing.len() == 64
+        && existing.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return Ok(Zeroizing::new(existing));
+    }
+
+    let generated = generate_random_hex_key()?;
+    keyring
+        .create_item(CACHE_KEY_LABEL, &attrs, generated.as_bytes(), true)
+        .await
+        .map_err(|err| VelaError::Auth(format!("failed to save cache key to OS keyring: {err}")))?;
+    Ok(generated)
+}
+
+/// Delete the local cache encryption key from the OS Keyring (crypto-shredding on Sign out).
+pub async fn clear_cache_key() -> Result<(), VelaError> {
+    let keyring = oo7::Keyring::new()
+        .await
+        .map_err(|err| VelaError::Auth(format!("OS keyring unavailable: {err}")))?;
+    let attrs = cache_key_attributes();
+    keyring
+        .delete(&attrs)
+        .await
+        .map_err(|err| VelaError::Auth(format!("failed to clear cache key: {err}")))?;
+    Ok(())
+}
+
+fn generate_random_hex_key() -> Result<Zeroizing<String>, VelaError> {
+    let mut raw = Zeroizing::new([0u8; 32]);
+    let mut urandom = fs::File::open("/dev/urandom")
+        .map_err(|err| VelaError::Other(format!("failed to open /dev/urandom: {err}")))?;
+    urandom
+        .read_exact(&mut *raw)
+        .map_err(|err| VelaError::Other(format!("failed to read random key bytes: {err}")))?;
+
+    let mut hex = Zeroizing::new(String::with_capacity(64));
+    for byte in raw.iter() {
+        use std::fmt::Write;
+        let _ = write!(&mut hex, "{byte:02x}");
+    }
+    Ok(hex)
 }

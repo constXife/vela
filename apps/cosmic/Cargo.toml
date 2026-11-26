@@ -16,6 +16,7 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 vela-core.workspace = true
+vela-cache.workspace = true
 vela-flows.workspace = true
 vela-jmap.workspace = true
 zeroize.workspace = true

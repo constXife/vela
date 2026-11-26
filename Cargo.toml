@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/vela-core",
+    "crates/vela-cache",
     "crates/vela-jmap",
     "crates/vela-flows",
     "apps/cosmic",
@@ -22,7 +23,9 @@ oo7 = { version = "0.4", default-features = false, features = ["tokio", "native_
 # Enable OS trust store roots in reqwest so private CAs (e.g. ca.example.com)
 # work with full TLS verification inside jmap-client.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots"] }
+rusqlite = { version = "0.32", features = ["bundled-sqlcipher"] }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 toml = "0.8"
@@ -39,5 +42,6 @@ libcosmic = { git = "https://github.com/pop-os/libcosmic", rev = "009fb9d4138f25
 ] }
 
 vela-core = { path = "crates/vela-core" }
+vela-cache = { path = "crates/vela-cache" }
 vela-jmap = { path = "crates/vela-jmap" }
 vela-flows = { path = "crates/vela-flows" }
