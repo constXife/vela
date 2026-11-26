@@ -107,8 +107,11 @@ impl fmt::Debug for JmapSession {
 impl JmapSession {
     /// Discover the JMAP session (`/.well-known/jmap`) and authenticate.
     pub async fn connect(config: &JmapConfig) -> Result<Self, VelaError> {
-        let builder = jmap_client::client::Client::new();
-        let builder = match &config.credentials {
+        let mut builder = jmap_client::client::Client::new();
+        if let Some(host) = extract_host(&config.server_url) {
+            builder = builder.follow_redirects([host]);
+        }
+        builder = match &config.credentials {
             JmapCredentials::Basic { username, password } => {
                 builder.credentials((username.as_str(), password.as_str()))
             }
@@ -517,6 +520,22 @@ fn join_body_parts(
         None
     } else {
         Some(joined)
+    }
+}
+
+fn extract_host(url: &str) -> Option<String> {
+    let without_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
+    let authority = without_scheme.split('/').next()?;
+    let host_port = authority.rsplit('@').next()?;
+    let host = if host_port.starts_with('[') {
+        host_port.split(']').next()?.trim_start_matches('[')
+    } else {
+        host_port.split(':').next()?
+    };
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_string())
     }
 }
 
