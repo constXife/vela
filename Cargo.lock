@@ -6596,6 +6596,7 @@ dependencies = [
 name = "vela-cosmic"
 version = "0.1.0"
 dependencies = [
+ "dirs 6.0.0",
  "jiff 0.2.46",
  "libcosmic",
  "tokio",
@@ -6633,6 +6634,23 @@ dependencies = [
  "vela-core",
  "vela-flows",
  "zeroize",
+]
+
+[[package]]
+name = "vela-mcp"
+version = "0.1.0"
+dependencies = [
+ "dirs 6.0.0",
+ "jiff 0.2.46",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "vela-cache",
+ "vela-core",
+ "vela-flows",
+ "vela-jmap",
 ]
 
 [[package]]

@@ -6,6 +6,7 @@ members = [
     "crates/vela-jmap",
     "crates/vela-flows",
     "apps/cosmic",
+    "apps/mcp",
 ]
 
 [workspace.package]
