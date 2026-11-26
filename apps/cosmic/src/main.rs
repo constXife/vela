@@ -272,6 +272,7 @@ enum Message {
     CloseSettings,
     SelectSettingsTab(SettingsTab),
     SettingsWindowOpened(window::Id),
+    DragSettingsWindow,
     ToggleAutoMarkRead(bool),
     StartResize(ResizeHandle),
     ResizeMove(f32),
@@ -1195,6 +1196,13 @@ impl cosmic::Application for App {
                 let _ = self.set_window_title("Vela Settings".to_string(), id);
                 Task::none()
             }
+            Message::DragSettingsWindow => {
+                if let Some(id) = self.settings_window {
+                    window::drag(id)
+                } else {
+                    Task::none()
+                }
+            }
             Message::ToggleAutoMarkRead(enabled) => {
                 self.auto_mark_read = enabled;
                 Task::none()
@@ -1339,6 +1347,7 @@ impl App {
     fn view_settings_window(&self) -> Element<'_, Message> {
         let header = widget::header_bar()
             .title("Vela Settings")
+            .on_drag(Message::DragSettingsWindow)
             .on_close(Message::CloseSettings);
 
         let nav_item = |tab: SettingsTab, icon: &'static str, label: &'static str| {
