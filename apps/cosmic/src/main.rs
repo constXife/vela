@@ -13,11 +13,12 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use cosmic::app::context_drawer::{self, ContextDrawer};
 use cosmic::app::{Core, Settings, Task};
 use cosmic::iced::core::layout::Limits;
-use cosmic::iced::{Alignment, Color, Event, Length, Size, Subscription, event, keyboard, mouse};
-use cosmic::{Element, executor, widget};
+use cosmic::iced::{
+    Alignment, Color, Event, Length, Size, Subscription, event, keyboard, mouse, window,
+};
+use cosmic::{ApplicationExt, Element, executor, widget};
 use jiff::{Timestamp, Zoned, tz::TimeZone};
 use vela_cache::VelaCache;
 use vela_core::{
@@ -79,10 +80,26 @@ enum Screen {
     Inbox,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AccountPreset {
+    CustomJmap,
+    Fastmail,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum SettingsTab {
+    #[default]
+    Accounts,
+    Reading,
+    Storage,
+}
+
 struct ConnectForm {
     server_url: String,
     username: String,
     password: String,
+    auth_kind: store::AuthKind,
+    password_hidden: bool,
     connecting: bool,
     error: Option<String>,
 }
@@ -95,10 +112,43 @@ impl ConnectForm {
                 .as_ref()
                 .map(|c| c.server_url.clone())
                 .unwrap_or_else(|| DEFAULT_SERVER_URL.to_string()),
-            username: saved.map(|c| c.username).unwrap_or_default(),
+            username: saved
+                .as_ref()
+                .map(|c| c.username.clone())
+                .unwrap_or_default(),
             password: String::new(),
+            auth_kind: saved.map(|c| c.auth_kind).unwrap_or_default(),
+            password_hidden: true,
             connecting: false,
             error: None,
+        }
+    }
+
+    fn fresh_empty() -> Self {
+        Self {
+            server_url: DEFAULT_SERVER_URL.to_string(),
+            username: String::new(),
+            password: String::new(),
+            auth_kind: store::AuthKind::Basic,
+            password_hidden: true,
+            connecting: false,
+            error: None,
+        }
+    }
+
+    fn apply_preset(&mut self, preset: AccountPreset) {
+        self.error = None;
+        match preset {
+            AccountPreset::CustomJmap => {
+                if self.server_url.is_empty() || self.server_url.contains("fastmail.com") {
+                    self.server_url = DEFAULT_SERVER_URL.to_string();
+                }
+                self.auth_kind = store::AuthKind::Basic;
+            }
+            AccountPreset::Fastmail => {
+                self.server_url = "https://api.fastmail.com".to_string();
+                self.auth_kind = store::AuthKind::Bearer;
+            }
         }
     }
 
@@ -129,7 +179,9 @@ struct App {
     downloading_blobs: HashSet<BlobId>,
     last_saved_attachment: Option<PathBuf>,
     show_shortcuts: bool,
-    show_settings: bool,
+    settings_window: Option<window::Id>,
+    settings_tab: SettingsTab,
+    add_account_form: ConnectForm,
     show_sidebar: bool,
     sidebar_width: f32,
     threads_width: f32,
@@ -161,12 +213,15 @@ enum Message {
     ServerUrlChanged(String),
     UsernameChanged(String),
     PasswordChanged(String),
+    AuthKindChanged(store::AuthKind),
+    ApplyPreset(AccountPreset),
+    TogglePasswordHidden,
     SubmitConnect,
     ConnectFinished(Result<ConnectedAccount, String>),
     OpenSampleMode,
     OpenAddAccount,
-    CancelAddAccount,
     SwitchAccount(String),
+    RemoveAccount(String),
     SignOut,
     SignedOut(Option<String>),
     SelectMailbox(MailboxId),
@@ -215,6 +270,8 @@ enum Message {
     ToggleSidebar,
     ToggleSettings,
     CloseSettings,
+    SelectSettingsTab(SettingsTab),
+    SettingsWindowOpened(window::Id),
     ToggleAutoMarkRead(bool),
     StartResize(ResizeHandle),
     ResizeMove(f32),
@@ -238,6 +295,30 @@ impl App {
             .and_then(|id| self.inbox.threads.iter().find(|t| &t.id == id))
             .map(|t| t.unread)
             .unwrap_or(false)
+    }
+
+    fn active_connect_form_mut(&mut self) -> &mut ConnectForm {
+        if let Screen::Connect(form) = &mut self.screen {
+            form
+        } else {
+            &mut self.add_account_form
+        }
+    }
+
+    fn open_settings_window(&mut self, tab: SettingsTab) -> Task<Message> {
+        self.settings_tab = tab;
+        if let Some(id) = self.settings_window {
+            return window::gain_focus(id);
+        }
+        let (id, spawn_window) = window::open(window::Settings {
+            size: Size::new(760.0, 560.0),
+            min_size: Some(Size::new(620.0, 440.0)),
+            exit_on_close_request: false,
+            decorations: false,
+            ..Default::default()
+        });
+        self.settings_window = Some(id);
+        spawn_window.map(|opened_id| cosmic::Action::App(Message::SettingsWindowOpened(opened_id)))
     }
 
     fn dispatch(&mut self, event: InboxEvent) -> Task<Message> {
@@ -458,7 +539,9 @@ impl cosmic::Application for App {
             downloading_blobs: HashSet::new(),
             last_saved_attachment: None,
             show_shortcuts: false,
-            show_settings: false,
+            settings_window: None,
+            settings_tab: SettingsTab::Accounts,
+            add_account_form: ConnectForm::fresh_empty(),
             show_sidebar: true,
             sidebar_width: DEFAULT_SIDEBAR_WIDTH,
             threads_width: DEFAULT_THREADS_WIDTH,
@@ -632,43 +715,64 @@ impl cosmic::Application for App {
                 }
             }
             Message::ServerUrlChanged(val) => {
-                if let Screen::Connect(form) = &mut self.screen {
-                    form.server_url = val;
-                }
+                self.active_connect_form_mut().server_url = val;
                 Task::none()
             }
             Message::UsernameChanged(val) => {
-                if let Screen::Connect(form) = &mut self.screen {
-                    form.username = val;
-                }
+                self.active_connect_form_mut().username = val;
                 Task::none()
             }
             Message::PasswordChanged(val) => {
-                if let Screen::Connect(form) = &mut self.screen {
-                    form.password = val;
-                }
+                self.active_connect_form_mut().password = val;
+                Task::none()
+            }
+            Message::AuthKindChanged(kind) => {
+                let form = self.active_connect_form_mut();
+                form.auth_kind = kind;
+                form.error = None;
+                Task::none()
+            }
+            Message::ApplyPreset(preset) => {
+                self.active_connect_form_mut().apply_preset(preset);
+                Task::none()
+            }
+            Message::TogglePasswordHidden => {
+                let form = self.active_connect_form_mut();
+                form.password_hidden = !form.password_hidden;
                 Task::none()
             }
             Message::SubmitConnect => {
-                let Screen::Connect(form) = &mut self.screen else {
-                    return Task::none();
-                };
+                let form = self.active_connect_form_mut();
                 if form.connecting {
                     return Task::none();
                 }
                 let server_url = form.server_url.trim().to_string();
                 let username = form.username.trim().to_string();
                 let password = form.password.clone();
-                if server_url.is_empty() || username.is_empty() || password.is_empty() {
-                    form.error = Some("Enter server URL, username, and password.".into());
-                    return Task::none();
-                }
+                let auth_kind = form.auth_kind;
+
+                let credentials = match auth_kind {
+                    store::AuthKind::Basic => {
+                        if server_url.is_empty() || username.is_empty() || password.is_empty() {
+                            form.error = Some("Enter server URL, username, and password.".into());
+                            return Task::none();
+                        }
+                        JmapCredentials::Basic { username, password }
+                    }
+                    store::AuthKind::Bearer => {
+                        if server_url.is_empty() || password.is_empty() {
+                            form.error = Some("Enter server URL and API token.".into());
+                            return Task::none();
+                        }
+                        JmapCredentials::Bearer { token: password }
+                    }
+                };
                 form.connecting = true;
                 form.error = None;
 
                 let config = JmapConfig {
                     server_url,
-                    credentials: JmapCredentials::Basic { username, password },
+                    credentials,
                 };
                 cosmic::task::future(async move {
                     let result = async {
@@ -686,6 +790,8 @@ impl cosmic::Application for App {
                 if let Screen::Connect(form) = &mut self.screen {
                     form.wipe_password();
                 }
+                self.add_account_form.wipe_password();
+                self.add_account_form = ConnectForm::fresh_empty();
                 self.refresh_accounts_from_disk();
                 self.active_account_id = Some(account_id.clone());
                 self.sync_states = SyncStates {
@@ -721,10 +827,9 @@ impl cosmic::Application for App {
                 ])
             }
             Message::ConnectFinished(Err(err)) => {
-                if let Screen::Connect(form) = &mut self.screen {
-                    form.connecting = false;
-                    form.error = Some(err);
-                }
+                let form = self.active_connect_form_mut();
+                form.connecting = false;
+                form.error = Some(err);
                 Task::none()
             }
             Message::OpenSampleMode => {
@@ -741,21 +846,27 @@ impl cosmic::Application for App {
                 self.dispatch(InboxEvent::MailboxesLoaded(sample::mailboxes()))
             }
             Message::OpenAddAccount => {
-                self.screen = Screen::Connect(ConnectForm {
-                    server_url: DEFAULT_SERVER_URL.to_string(),
-                    username: String::new(),
-                    password: String::new(),
-                    connecting: false,
-                    error: None,
-                });
-                Task::none()
+                self.add_account_form.error = None;
+                self.open_settings_window(SettingsTab::Accounts)
             }
-            Message::CancelAddAccount => {
-                if let Screen::Connect(form) = &mut self.screen {
-                    form.wipe_password();
+            Message::RemoveAccount(account_id) => {
+                let was_active = self.active_account_id.as_deref() == Some(account_id.as_str());
+                if was_active {
+                    self.active_account_id = None;
+                    self.session = None;
+                    self.cache = None;
+                    self.syncing = false;
+                    self.sync_states = SyncStates::default();
+                    self.inbox = InboxState::new();
                 }
-                self.screen = Screen::Inbox;
-                Task::none()
+                cosmic::task::future(async move {
+                    let next = store::remove_account(&account_id).await.ok().flatten();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        vela_cache::destroy_account_cache(&account_id)
+                    })
+                    .await;
+                    Message::SignedOut(if was_active { next } else { None })
+                })
             }
             Message::SwitchAccount(account_id) => {
                 if self.active_account_id.as_deref() == Some(account_id.as_str())
@@ -805,6 +916,9 @@ impl cosmic::Application for App {
                     self.syncing = true;
                     self.screen = Screen::Inbox;
                     spawn_account_load_tasks(next_id)
+                } else if self.active_account_id.is_some() {
+                    // An inactive account was removed from Settings; keep current session active.
+                    Task::none()
                 } else {
                     self.active_account_id = None;
                     self.screen = Screen::Connect(ConnectForm::from_saved_or_default());
@@ -1053,10 +1167,6 @@ impl cosmic::Application for App {
                 if self.show_shortcuts {
                     self.show_shortcuts = false;
                     Task::none()
-                } else if self.show_settings {
-                    self.show_settings = false;
-                    self.core.window.show_context = false;
-                    Task::none()
                 } else if self.inbox.has_active_filter() {
                     self.dispatch(InboxEvent::ClearFilters)
                 } else {
@@ -1067,14 +1177,21 @@ impl cosmic::Application for App {
                 self.show_sidebar = !self.show_sidebar;
                 Task::none()
             }
-            Message::ToggleSettings => {
-                self.show_settings = !self.show_settings;
-                self.core.window.show_context = self.show_settings;
+            Message::ToggleSettings => self.open_settings_window(self.settings_tab),
+            Message::CloseSettings => {
+                if let Some(id) = self.settings_window.take() {
+                    window::close(id)
+                } else {
+                    Task::none()
+                }
+            }
+            Message::SelectSettingsTab(tab) => {
+                self.settings_tab = tab;
                 Task::none()
             }
-            Message::CloseSettings => {
-                self.show_settings = false;
-                self.core.window.show_context = false;
+            Message::SettingsWindowOpened(id) => {
+                self.settings_window = Some(id);
+                let _ = self.set_window_title("Vela Settings".to_string(), id);
                 Task::none()
             }
             Message::ToggleAutoMarkRead(enabled) => {
@@ -1180,12 +1297,9 @@ impl cosmic::Application for App {
         ]
     }
 
-    fn context_drawer(&self) -> Option<ContextDrawer<'_, Self::Message>> {
-        if self.show_settings && matches!(self.screen, Screen::Inbox) {
-            Some(
-                context_drawer::context_drawer(self.view_settings_drawer(), Message::CloseSettings)
-                    .title("Settings"),
-            )
+    fn on_close_requested(&self, id: window::Id) -> Option<Self::Message> {
+        if self.settings_window == Some(id) {
+            Some(Message::CloseSettings)
         } else {
             None
         }
@@ -1208,76 +1322,191 @@ impl cosmic::Application for App {
             Screen::Inbox => self.view_inbox(),
         }
     }
+
+    fn view_window(&self, id: window::Id) -> Element<'_, Self::Message> {
+        if self.settings_window == Some(id) {
+            self.view_settings_window()
+        } else {
+            widget::container(widget::text::body("Unknown window"))
+                .center(Length::Fill)
+                .into()
+        }
+    }
 }
 
 impl App {
-    fn view_settings_drawer(&self) -> Element<'_, Message> {
-        let reading_section = widget::settings::section()
-            .title("Reading & Privacy")
-            .add(
-                widget::settings::item::builder("Auto-mark read on open")
-                    .description("Automatically mark threads as read when selected")
-                    .toggler(self.auto_mark_read, Message::ToggleAutoMarkRead),
-            )
-            .add(
-                widget::settings::item::builder("External images")
-                    .description("Blocked by default to prevent tracking pixels")
-                    .control(
-                        widget::text::caption("Blocked")
+    fn view_settings_window(&self) -> Element<'_, Message> {
+        let header = widget::header_bar()
+            .title("Vela Settings")
+            .on_close(Message::CloseSettings);
+
+        let nav_item = |tab: SettingsTab, icon: &'static str, label: &'static str| {
+            let selected = self.settings_tab == tab;
+            let row = widget::row::with_capacity(2)
+                .spacing(10)
+                .align_y(Alignment::Center)
+                .push(widget::icon::from_name(icon).size(16))
+                .push(widget::text::body(label));
+            widget::button::custom(row)
+                .class(cosmic::theme::Button::ListItem([8.0; 4]))
+                .selected(selected)
+                .padding([8, 12])
+                .width(Length::Fill)
+                .on_press(Message::SelectSettingsTab(tab))
+        };
+
+        let nav = widget::column::with_capacity(3)
+            .spacing(4)
+            .padding(12)
+            .width(Length::Fixed(200.0))
+            .push(nav_item(
+                SettingsTab::Accounts,
+                "mail-folder-inbox-symbolic",
+                "Accounts",
+            ))
+            .push(nav_item(
+                SettingsTab::Reading,
+                "preferences-system-symbolic",
+                "Reading & Privacy",
+            ))
+            .push(nav_item(
+                SettingsTab::Storage,
+                "folder-symbolic",
+                "Layout & Cache",
+            ));
+
+        let page: Element<'_, Message> = match self.settings_tab {
+            SettingsTab::Accounts => {
+                let mut col = widget::column::with_capacity(4).spacing(16);
+
+                if !self.accounts.is_empty() {
+                    let mut section = widget::settings::section().title("Connected Accounts");
+                    for acc in &self.accounts {
+                        let is_active = self.active_account_id.as_deref() == Some(acc.id.as_str());
+                        let mut controls = widget::row::with_capacity(2)
+                            .spacing(8)
+                            .align_y(Alignment::Center);
+                        if !is_active {
+                            controls = controls.push(
+                                widget::button::standard("Switch")
+                                    .on_press(Message::SwitchAccount(acc.id.clone())),
+                            );
+                        } else {
+                            controls = controls.push(
+                                widget::text::caption("Active").class(cosmic::theme::Text::Accent),
+                            );
+                        }
+                        controls = controls.push(
+                            widget::button::text("Remove")
+                                .on_press(Message::RemoveAccount(acc.id.clone())),
+                        );
+
+                        section = section.add(
+                            widget::settings::item::builder(acc.username.clone())
+                                .description(acc.host())
+                                .control(controls),
+                        );
+                    }
+                    col = col.push(section);
+                }
+
+                let add_card = widget::container(
+                    widget::column::with_capacity(2)
+                        .spacing(12)
+                        .push(widget::text::title4("Add JMAP Account"))
+                        .push(self.view_connect_form(&self.add_account_form, false)),
+                )
+                .padding(18)
+                .width(Length::Fill)
+                .class(cosmic::theme::Container::Card);
+
+                col = col.push(add_card);
+                col.into()
+            }
+            SettingsTab::Reading => widget::settings::section()
+                .title("Reading & Privacy")
+                .add(
+                    widget::settings::item::builder("Auto-mark read on open")
+                        .description("Automatically mark threads as read when selected")
+                        .toggler(self.auto_mark_read, Message::ToggleAutoMarkRead),
+                )
+                .add(
+                    widget::settings::item::builder("External images")
+                        .description("Blocked by default to prevent tracking pixels")
+                        .control(
+                            widget::text::caption("Blocked")
+                                .class(cosmic::theme::Text::Custom(muted_text_style)),
+                        ),
+                )
+                .into(),
+            SettingsTab::Storage => {
+                let layout_section = widget::settings::section()
+                    .title("Layout")
+                    .add(
+                        widget::settings::item::builder("Mailboxes sidebar")
+                            .description("Show or hide the left folder column (Ctrl+B)")
+                            .toggler(self.show_sidebar, |_| Message::ToggleSidebar),
+                    )
+                    .add(
+                        widget::settings::item::builder("Pane widths")
+                            .description("Drag vertical dividers between panes to resize")
+                            .control(
+                                widget::button::standard("Reset")
+                                    .on_press(Message::ResetPaneWidths),
+                            ),
+                    );
+
+                let mut cache_section = widget::settings::section().title("Encrypted Cache").add(
+                    widget::settings::item::builder("Local storage")
+                        .description("SQLCipher AES-256 with per-account key in OS Keyring")
+                        .control(
+                            widget::text::caption(if self.cache.is_some() {
+                                "Active"
+                            } else {
+                                "Sample"
+                            })
                             .class(cosmic::theme::Text::Custom(muted_text_style)),
-                    ),
-            );
+                        ),
+                );
+                if self.session.is_some() {
+                    cache_section = cache_section.add(
+                        widget::settings::item::builder("Rebuild cache")
+                            .description("Wipe local cache and re-sync from JMAP")
+                            .control(
+                                widget::button::standard("Clear & Sync")
+                                    .on_press(Message::ClearCacheAndResync),
+                            ),
+                    );
+                }
 
-        let layout_section = widget::settings::section()
-            .title("Layout")
-            .add(
-                widget::settings::item::builder("Mailboxes sidebar")
-                    .description("Show or hide the left folder column (Ctrl+B)")
-                    .toggler(self.show_sidebar, |_| Message::ToggleSidebar),
+                widget::column::with_capacity(2)
+                    .spacing(16)
+                    .push(layout_section)
+                    .push(cache_section)
+                    .into()
+            }
+        };
+
+        let body = widget::row::with_capacity(3)
+            .push(nav)
+            .push(widget::divider::vertical::default())
+            .push(
+                widget::scrollable(widget::container(page).padding(20).width(Length::Fill))
+                    .width(Length::Fill)
+                    .height(Length::Fill),
             )
-            .add(
-                widget::settings::item::builder("Pane widths")
-                    .description("Drag dividers between panes to resize")
-                    .control(widget::button::standard("Reset").on_press(Message::ResetPaneWidths)),
-            );
+            .width(Length::Fill)
+            .height(Length::Fill);
 
-        let mut cache_section = widget::settings::section().title("Encrypted Cache").add(
-            widget::settings::item::builder("Local storage")
-                .description("SQLCipher AES-256 with key in OS Keyring")
-                .control(
-                    widget::text::caption(if self.cache.is_some() {
-                        "Active"
-                    } else {
-                        "Sample"
-                    })
-                    .class(cosmic::theme::Text::Custom(muted_text_style)),
-                ),
-        );
-        if self.session.is_some() {
-            cache_section = cache_section.add(
-                widget::settings::item::builder("Rebuild cache")
-                    .description("Wipe local cache and re-sync from JMAP")
-                    .control(
-                        widget::button::standard("Clear & Sync")
-                            .on_press(Message::ClearCacheAndResync),
-                    ),
-            );
-        }
-
-        let accounts_section = widget::settings::section().title("Accounts").add(
-            widget::settings::item::builder("Connected accounts")
-                .description(format!("{} saved JMAP account(s)", self.accounts.len()))
-                .control(widget::button::standard("Add account").on_press(Message::OpenAddAccount)),
-        );
-
-        widget::column::with_capacity(4)
-            .spacing(16)
-            .push(reading_section)
-            .push(layout_section)
-            .push(cache_section)
-            .push(accounts_section)
+        widget::column::with_capacity(3)
+            .push(header)
+            .push(widget::divider::horizontal::default())
+            .push(body)
+            .width(Length::Fill)
+            .height(Length::Fill)
             .into()
     }
+
     fn view_shortcuts_dialog(&self) -> Element<'_, Message> {
         let content = widget::column::with_capacity(6)
             .spacing(12)
@@ -1318,32 +1547,144 @@ impl App {
             .primary_action(widget::button::suggested("Close").on_press(Message::CloseShortcuts))
             .into()
     }
+
     fn view_connect<'a>(&self, form: &'a ConnectForm) -> Element<'a, Message> {
-        let mut card = widget::column::with_capacity(8)
-            .spacing(12)
+        let card = widget::column::with_capacity(3)
+            .spacing(14)
             .push(widget::text::title2("Sign in to Vela"))
-            .push(widget::text::caption(
-                "Password is stored securely in the OS Keyring; only server URL and username are saved in ~/.config/vela/config.toml.",
-            ))
             .push(
-                widget::text_input("Server URL (e.g. https://mail.example.com)", &form.server_url)
-                    .on_input(Message::ServerUrlChanged)
-                    .on_submit(|_| Message::SubmitConnect),
+                widget::text::caption("Connect a JMAP email server (Stalwart, Fastmail, Cyrus).")
+                    .class(cosmic::theme::Text::Custom(muted_text_style)),
+            )
+            .push(self.view_connect_form(form, true));
+
+        let boxed = widget::container(card)
+            .padding(24)
+            .width(Length::Fixed(460.0))
+            .class(cosmic::theme::Container::Card);
+
+        widget::container(boxed).center(Length::Fill).into()
+    }
+
+    fn view_connect_form<'a>(
+        &self,
+        form: &'a ConnectForm,
+        show_sample_action: bool,
+    ) -> Element<'a, Message> {
+        let presets = widget::row::with_capacity(3)
+            .spacing(6)
+            .align_y(Alignment::Center)
+            .push(
+                widget::text::caption("Preset:")
+                    .class(cosmic::theme::Text::Custom(muted_text_style)),
             )
             .push(
-                widget::text_input("Username or email", &form.username)
-                    .on_input(Message::UsernameChanged)
-                    .on_submit(|_| Message::SubmitConnect),
+                widget::button::custom(widget::text::caption("Custom JMAP"))
+                    .class(cosmic::theme::Button::ListItem([6.0; 4]))
+                    .selected(form.auth_kind == store::AuthKind::Basic)
+                    .padding([4, 10])
+                    .on_press(Message::ApplyPreset(AccountPreset::CustomJmap)),
             )
             .push(
-                widget::text_input("Password", &form.password)
-                    .password()
-                    .on_input(Message::PasswordChanged)
-                    .on_submit(|_| Message::SubmitConnect),
+                widget::button::custom(widget::text::caption("Fastmail"))
+                    .class(cosmic::theme::Button::ListItem([6.0; 4]))
+                    .selected(
+                        form.auth_kind == store::AuthKind::Bearer
+                            && form.server_url.contains("fastmail.com"),
+                    )
+                    .padding([4, 10])
+                    .on_press(Message::ApplyPreset(AccountPreset::Fastmail)),
             );
 
+        let auth_toggle = widget::row::with_capacity(3)
+            .spacing(6)
+            .align_y(Alignment::Center)
+            .push(
+                widget::text::caption("Auth:").class(cosmic::theme::Text::Custom(muted_text_style)),
+            )
+            .push(
+                widget::button::custom(widget::text::caption("Password (Basic)"))
+                    .class(cosmic::theme::Button::ListItem([6.0; 4]))
+                    .selected(form.auth_kind == store::AuthKind::Basic)
+                    .padding([4, 10])
+                    .on_press(Message::AuthKindChanged(store::AuthKind::Basic)),
+            )
+            .push(
+                widget::button::custom(widget::text::caption("API Token (Bearer)"))
+                    .class(cosmic::theme::Button::ListItem([6.0; 4]))
+                    .selected(form.auth_kind == store::AuthKind::Bearer)
+                    .padding([4, 10])
+                    .on_press(Message::AuthKindChanged(store::AuthKind::Bearer)),
+            );
+
+        let mut fields = widget::column::with_capacity(8)
+            .spacing(12)
+            .push(presets)
+            .push(auth_toggle)
+            .push(
+                widget::column::with_capacity(2)
+                    .spacing(4)
+                    .push(
+                        widget::text::caption("Server URL")
+                            .class(cosmic::theme::Text::Custom(muted_text_style)),
+                    )
+                    .push(
+                        widget::text_input("https://mail.example.com", &form.server_url)
+                            .on_input(Message::ServerUrlChanged)
+                            .on_submit(|_| Message::SubmitConnect),
+                    ),
+            );
+
+        if form.auth_kind == store::AuthKind::Basic {
+            fields = fields.push(
+                widget::column::with_capacity(2)
+                    .spacing(4)
+                    .push(
+                        widget::text::caption("Username or email")
+                            .class(cosmic::theme::Text::Custom(muted_text_style)),
+                    )
+                    .push(
+                        widget::text_input("you@example.com", &form.username)
+                            .on_input(Message::UsernameChanged)
+                            .on_submit(|_| Message::SubmitConnect),
+                    ),
+            );
+        }
+
+        let secret_label = match form.auth_kind {
+            store::AuthKind::Basic => "Password",
+            store::AuthKind::Bearer => "API Token",
+        };
+        let secret_placeholder = match form.auth_kind {
+            store::AuthKind::Basic => "Enter password",
+            store::AuthKind::Bearer => "fmu1-…",
+        };
+        fields = fields.push(
+            widget::column::with_capacity(2)
+                .spacing(4)
+                .push(
+                    widget::text::caption(secret_label)
+                        .class(cosmic::theme::Text::Custom(muted_text_style)),
+                )
+                .push(
+                    widget::secure_input(
+                        secret_placeholder,
+                        &form.password,
+                        Some(Message::TogglePasswordHidden),
+                        form.password_hidden,
+                    )
+                    .on_input(Message::PasswordChanged)
+                    .on_submit(|_| Message::SubmitConnect),
+                ),
+        );
+
         if let Some(err) = &form.error {
-            card = card.push(widget::text::caption(format!("Error: {err}")));
+            fields = fields.push(
+                widget::container(widget::text::caption(format!("Error: {err}")))
+                    .padding([8, 12])
+                    .width(Length::Fill)
+                    .class(cosmic::theme::Container::Primary),
+            );
         }
 
         let connect_label = if form.connecting {
@@ -1356,26 +1697,24 @@ impl App {
             connect_btn = connect_btn.on_press(Message::SubmitConnect);
         }
 
-        let secondary_action = if !self.accounts.is_empty() {
-            widget::button::text("Cancel").on_press(Message::CancelAddAccount)
-        } else {
-            widget::button::text("Preview sample data").on_press(Message::OpenSampleMode)
-        };
-
-        let actions = widget::row::with_capacity(2)
-            .push(connect_btn)
-            .push(secondary_action)
+        let mut actions = widget::row::with_capacity(3)
             .spacing(12)
             .align_y(Alignment::Center);
 
-        card = card.push(actions);
+        if show_sample_action {
+            actions = actions.push(
+                widget::button::text("Preview sample data").on_press(Message::OpenSampleMode),
+            );
+        } else {
+            actions = actions.push(
+                widget::text::caption("Stored securely in OS Keyring")
+                    .class(cosmic::theme::Text::Custom(muted_text_style)),
+            );
+        }
 
-        let boxed = widget::container(card)
-            .padding(24)
-            .width(Length::Fixed(440.0))
-            .class(cosmic::theme::Container::Card);
+        actions = actions.push(widget::space::horizontal()).push(connect_btn);
 
-        widget::container(boxed).center(Length::Fill).into()
+        fields.push(actions).into()
     }
 
     fn view_inbox(&self) -> Element<'_, Message> {
