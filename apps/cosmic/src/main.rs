@@ -37,17 +37,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let new_instance = args.iter().any(|a| a == "--new-instance")
+        || std::env::var_os("VELA_NEW_INSTANCE").is_some();
+    let sample_mode =
+        args.iter().any(|a| a == "--sample") || std::env::var_os("VELA_SAMPLE").is_some();
+
     let settings = Settings::default().size(WINDOW_SIZE).size_limits(
         Limits::NONE
             .min_width(WINDOW_MIN.width)
             .min_height(WINDOW_MIN.height),
     );
-    cosmic::app::run_single_instance::<App>(settings, Flags)?;
+    let flags = Flags { sample_mode };
+    if new_instance {
+        cosmic::app::run::<App>(settings, flags)?;
+    } else {
+        cosmic::app::run_single_instance::<App>(settings, flags)?;
+    }
     Ok(())
 }
 
 #[derive(Clone, Debug)]
-struct Flags;
+struct Flags {
+    sample_mode: bool,
+}
 
 impl cosmic::app::CosmicFlags for Flags {
     type SubCommand = String;
@@ -250,13 +263,19 @@ impl cosmic::Application for App {
         &mut self.core
     }
 
-    fn init(core: Core, _flags: Self::Flags) -> (Self, Task<Self::Message>) {
-        let app = Self {
+    fn init(core: Core, flags: Self::Flags) -> (Self, Task<Self::Message>) {
+        let mut app = Self {
             core,
             screen: Screen::Starting,
             inbox: InboxState::new(),
             session: None,
         };
+
+        if flags.sample_mode {
+            app.screen = Screen::Inbox;
+            let task = app.dispatch(InboxEvent::MailboxesLoaded(sample::mailboxes()));
+            return (app, task);
+        }
 
         let task = cosmic::task::future(async move {
             let result = async {
@@ -638,7 +657,9 @@ impl App {
                 )
                 .align_y(Alignment::Center),
         )
-        .padding([12, 16])
+        .padding([0, 16])
+        .align_y(Alignment::Center)
+        .height(Length::Fixed(52.0))
         .width(Length::Fill);
 
         let now = Zoned::now();
@@ -799,7 +820,7 @@ impl App {
             widget::row::with_capacity(3)
                 .push(widget::tooltip(
                     widget::button::standard("Archive")
-                        .leading_icon(widget::icon::from_name("folder-documents-symbolic").handle())
+                        .leading_icon(widget::icon::from_name("mail-archive-symbolic").handle())
                         .on_press(Message::Archive),
                     widget::text::caption("Archive (E)"),
                     widget::tooltip::Position::Bottom,
@@ -821,7 +842,9 @@ impl App {
                 .spacing(8)
                 .align_y(Alignment::Center),
         )
-        .padding([10, 20])
+        .padding([0, 20])
+        .align_y(Alignment::Center)
+        .height(Length::Fixed(52.0))
         .width(Length::Fill);
 
         let mut col = widget::column::with_capacity(self.inbox.conversation.len())
@@ -976,10 +999,10 @@ impl App {
 
 fn mailbox_icon_name(role: MailboxRole) -> &'static str {
     match role {
-        MailboxRole::Inbox => "mail-inbox-symbolic",
-        MailboxRole::Drafts => "document-edit-symbolic",
+        MailboxRole::Inbox => "mail-folder-inbox-symbolic",
+        MailboxRole::Drafts => "edit-symbolic",
         MailboxRole::Sent => "mail-send-symbolic",
-        MailboxRole::Archive => "folder-documents-symbolic",
+        MailboxRole::Archive => "mail-archive-symbolic",
         MailboxRole::Junk => "mail-mark-junk-symbolic",
         MailboxRole::Trash => "user-trash-symbolic",
         MailboxRole::Custom => "folder-symbolic",

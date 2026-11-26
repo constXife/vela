@@ -2,10 +2,23 @@
 
 //! Sample in-memory mailbox fixture used before live JMAP is wired up.
 
-use jiff::Timestamp;
+use jiff::{SignedDuration, Timestamp};
 use vela_core::{
-    EmailAddress, Mailbox, MailboxId, MailboxRole, Message, MessageId, ThreadId, ThreadSummary,
+    Attachment, BlobId, EmailAddress, Mailbox, MailboxId, MailboxRole, Message, MessageId,
+    ThreadId, ThreadSummary,
 };
+
+fn minutes_ago(mins: i64) -> Timestamp {
+    Timestamp::now()
+        .checked_sub(SignedDuration::from_mins(mins))
+        .unwrap_or(Timestamp::UNIX_EPOCH)
+}
+
+fn days_ago(days: i64) -> Timestamp {
+    Timestamp::now()
+        .checked_sub(SignedDuration::from_hours(days * 24))
+        .unwrap_or(Timestamp::UNIX_EPOCH)
+}
 
 pub fn mailboxes() -> Vec<Mailbox> {
     vec![
@@ -66,7 +79,7 @@ pub fn threads_for_mailbox(mailbox_id: &MailboxId) -> Vec<ThreadSummary> {
                 name: Some("Vela Prototype".into()),
                 email: "vela@yogg.local".into(),
             }],
-            received_at: Timestamp::UNIX_EPOCH,
+            received_at: minutes_ago(12),
             message_count: 2,
             unread: true,
             flagged: false,
@@ -81,7 +94,7 @@ pub fn threads_for_mailbox(mailbox_id: &MailboxId) -> Vec<ThreadSummary> {
                 name: Some("COSMIC Digest".into()),
                 email: "digest@example.org".into(),
             }],
-            received_at: Timestamp::UNIX_EPOCH,
+            received_at: days_ago(1),
             message_count: 1,
             unread: true,
             flagged: false,
@@ -96,11 +109,11 @@ pub fn threads_for_mailbox(mailbox_id: &MailboxId) -> Vec<ThreadSummary> {
                 name: Some("Postmaster".into()),
                 email: "postmaster@yogg.local".into(),
             }],
-            received_at: Timestamp::UNIX_EPOCH,
+            received_at: days_ago(4),
             message_count: 1,
             unread: false,
             flagged: true,
-            has_attachments: false,
+            has_attachments: true,
             mailbox_ids: vec![MailboxId("inbox".into())],
         },
     ]
@@ -122,7 +135,7 @@ pub fn messages_for_thread(thread_id: &ThreadId) -> Vec<Message> {
                     email: "you@yogg.local".into(),
                 }],
                 cc: vec![],
-                received_at: Timestamp::UNIX_EPOCH,
+                received_at: minutes_ago(42),
                 unread: false,
                 text_body: Some(
                     "Three-pane layout is live:\n\
@@ -149,7 +162,7 @@ pub fn messages_for_thread(thread_id: &ThreadId) -> Vec<Message> {
                     email: "vela@yogg.local".into(),
                 }],
                 cc: vec![],
-                received_at: Timestamp::UNIX_EPOCH,
+                received_at: minutes_ago(12),
                 unread: true,
                 text_body: Some(
                     "Looks smooth! Next up: connect to Stalwart on yogg and run the real HTML/newsletter corpus spike."
@@ -173,7 +186,7 @@ pub fn messages_for_thread(thread_id: &ThreadId) -> Vec<Message> {
                 email: "you@yogg.local".into(),
             }],
             cc: vec![],
-            received_at: Timestamp::UNIX_EPOCH,
+            received_at: days_ago(1),
             unread: true,
             text_body: Some(
                 "This sample message simulates an HTML newsletter with external images.\n\n\
@@ -197,14 +210,21 @@ pub fn messages_for_thread(thread_id: &ThreadId) -> Vec<Message> {
                 email: "you@yogg.local".into(),
             }],
             cc: vec![],
-            received_at: Timestamp::UNIX_EPOCH,
+            received_at: days_ago(4),
             unread: false,
             text_body: Some(
                 "Ready for live JMAP spike: mailbox_query, thread_get, email_get, and EventSource state updates."
                     .into(),
             ),
             html_body: None,
-            attachments: vec![],
+            attachments: vec![Attachment {
+                blob_id: BlobId("blob-jmap-report".into()),
+                name: Some("jmap-diagnostics.txt".into()),
+                mime_type: "text/plain".into(),
+                size: 14_336,
+                cid: None,
+                is_inline: false,
+            }],
             has_remote_images: false,
         }],
         _ => Vec::new(),

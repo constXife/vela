@@ -45,6 +45,10 @@
             just
             openssl
             wayland-protocols
+            # Isolated headless Wayland UI testing sandbox
+            sway
+            grim
+            wtype
           ]
           ++ runtimeLibs;
 
