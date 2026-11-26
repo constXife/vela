@@ -135,6 +135,10 @@ enum Message {
         thread_id: ThreadId,
         result: Result<Vec<MailMessage>, String>,
     },
+    ConversationPrefetched {
+        thread_id: ThreadId,
+        result: Result<Vec<MailMessage>, String>,
+    },
     Archive,
     Trash,
     ToggleRead,
@@ -201,6 +205,22 @@ impl App {
                         messages,
                     })
                 }
+            }
+            InboxEffect::PrefetchConversation { thread_id } => {
+                let Some(session) = self.session.clone() else {
+                    return Task::none();
+                };
+                let tid = thread_id.clone();
+                cosmic::task::future(async move {
+                    let result = session
+                        .load_conversation(&tid)
+                        .await
+                        .map_err(|e| e.to_string());
+                    Message::ConversationPrefetched {
+                        thread_id: tid,
+                        result,
+                    }
+                })
             }
             InboxEffect::ApplyTriage {
                 thread_id,
@@ -460,6 +480,13 @@ impl cosmic::Application for App {
                     messages,
                 }),
                 Err(err) => self.dispatch(InboxEvent::ReportError(err)),
+            },
+            Message::ConversationPrefetched { thread_id, result } => match result {
+                Ok(messages) => self.dispatch(InboxEvent::ConversationPrefetched {
+                    thread_id,
+                    messages,
+                }),
+                Err(_) => self.dispatch(InboxEvent::PrefetchFailed { thread_id }),
             },
             Message::Archive => self.dispatch(InboxEvent::ArchiveSelected),
             Message::Trash => self.dispatch(InboxEvent::TrashSelected),
@@ -813,24 +840,14 @@ impl App {
     }
 
     fn view_conversation(&self) -> Element<'_, Message> {
-        let selected_unread = self
+        let selected_summary = self
             .inbox
             .selected_thread
             .as_ref()
-            .and_then(|id| self.inbox.threads.iter().find(|t| &t.id == id))
-            .map(|t| t.unread)
-            .unwrap_or(false);
+            .and_then(|id| self.inbox.threads.iter().find(|t| &t.id == id));
+        let selected_unread = selected_summary.map(|t| t.unread).unwrap_or(false);
 
-        if self.inbox.loading_conversation && self.inbox.conversation.is_empty() {
-            return widget::container(
-                widget::text::body("Loading conversation…")
-                    .class(cosmic::theme::Text::Custom(muted_text_style)),
-            )
-            .center(Length::Fill)
-            .into();
-        }
-
-        if self.inbox.conversation.is_empty() {
+        if self.inbox.conversation.is_empty() && !self.inbox.loading_conversation {
             return widget::container(
                 widget::text::body("Select a conversation to read.")
                     .class(cosmic::theme::Text::Custom(muted_text_style)),
@@ -881,6 +898,97 @@ impl App {
         .align_y(Alignment::Center)
         .height(Length::Fixed(52.0))
         .width(Length::Fill);
+
+        if self.inbox.conversation.is_empty() {
+            let preview_body: Element<'_, Message> = if let Some(summary) = selected_summary {
+                let subject = if summary.subject.trim().is_empty() {
+                    "(No subject)"
+                } else {
+                    summary.subject.as_str()
+                };
+                let primary_sender = summary.senders.first();
+                let sender_name = primary_sender
+                    .map(|s| s.display_name())
+                    .unwrap_or("Unknown");
+                let initials = sender_initials(sender_name);
+                let timestamp = format_full_time(summary.received_at);
+                let snippet = html::clean_snippet(&summary.snippet, 240);
+
+                let avatar = widget::container(
+                    widget::text::caption(initials)
+                        .class(cosmic::theme::Text::Custom(primary_text_style)),
+                )
+                .center(Length::Fixed(32.0))
+                .class(cosmic::theme::Container::custom(avatar_container_style));
+
+                let header_row = widget::row::with_capacity(2)
+                    .push(avatar)
+                    .push(
+                        widget::row::with_capacity(3)
+                            .push(
+                                widget::text::heading(sender_name)
+                                    .class(cosmic::theme::Text::Custom(primary_text_style)),
+                            )
+                            .push(widget::space::horizontal())
+                            .push(
+                                widget::text::caption(timestamp)
+                                    .class(cosmic::theme::Text::Custom(muted_text_style)),
+                            )
+                            .spacing(12)
+                            .align_y(Alignment::Center),
+                    )
+                    .spacing(12)
+                    .align_y(Alignment::Center);
+
+                let mut card = widget::column::with_capacity(4)
+                    .spacing(12)
+                    .push(header_row)
+                    .push(widget::divider::horizontal::light());
+
+                if !snippet.is_empty() {
+                    card = card.push(
+                        widget::text::body(snippet)
+                            .class(cosmic::theme::Text::Custom(secondary_text_style)),
+                    );
+                }
+                card = card.push(
+                    widget::text::caption("Loading full message…")
+                        .class(cosmic::theme::Text::Custom(muted_text_style)),
+                );
+
+                widget::column::with_capacity(2)
+                    .spacing(14)
+                    .padding(20)
+                    .max_width(840.0)
+                    .push(widget::text::title3(subject))
+                    .push(
+                        widget::container(card)
+                            .padding(16)
+                            .class(cosmic::theme::Container::Card)
+                            .width(Length::Fill),
+                    )
+                    .into()
+            } else {
+                widget::container(
+                    widget::text::body("Loading conversation…")
+                        .class(cosmic::theme::Text::Custom(muted_text_style)),
+                )
+                .center(Length::Fill)
+                .into()
+            };
+
+            return widget::column::with_capacity(3)
+                .push(toolbar)
+                .push(widget::divider::horizontal::default())
+                .push(
+                    widget::scrollable(preview_body)
+                        .width(Length::Fill)
+                        .height(Length::Fill),
+                )
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into();
+        }
 
         let thread_subject = self
             .inbox

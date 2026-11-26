@@ -9,11 +9,15 @@
 
 pub mod html;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use vela_core::{
     Mailbox, MailboxId, MailboxRole, Message, MessageId, RemoteImagePolicy, ThreadId, ThreadSummary,
 };
+
+const CONVERSATION_CACHE_LIMIT: usize = 128;
+const INITIAL_PREFETCH_COUNT: usize = 4;
+const NEIGHBOR_PREFETCH_COUNT: usize = 3;
 
 /// Monotonic operation identifier used to discard stale async responses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -47,6 +51,8 @@ pub struct InboxState {
     pub last_undo: Option<UndoEntry>,
     pub status_banner: Option<String>,
     conversation_cache: HashMap<ThreadId, Vec<Message>>,
+    conversation_cache_order: VecDeque<ThreadId>,
+    prefetching_threads: HashSet<ThreadId>,
     next_op: u64,
     active_mailbox_op: Option<OpId>,
     active_thread_op: Option<OpId>,
@@ -69,6 +75,13 @@ pub enum InboxEvent {
         thread_id: ThreadId,
         messages: Vec<Message>,
     },
+    ConversationPrefetched {
+        thread_id: ThreadId,
+        messages: Vec<Message>,
+    },
+    PrefetchFailed {
+        thread_id: ThreadId,
+    },
     ArchiveSelected,
     TrashSelected,
     ToggleSelectedRead,
@@ -86,6 +99,9 @@ pub enum InboxEffect {
     },
     LoadConversation {
         op_id: OpId,
+        thread_id: ThreadId,
+    },
+    PrefetchConversation {
         thread_id: ThreadId,
     },
     ApplyTriage {
@@ -151,9 +167,12 @@ impl InboxState {
                 self.threads = threads;
                 self.selected_thread = None;
                 self.conversation.clear();
+                self.prefetching_threads.clear();
                 if let Some(first) = self.threads.first() {
                     let id = first.id.clone();
-                    return self.select_thread(id);
+                    let mut effects = self.select_thread(id);
+                    effects.extend(self.prefetch_around(0, INITIAL_PREFETCH_COUNT));
+                    return effects;
                 }
                 Vec::new()
             }
@@ -165,19 +184,36 @@ impl InboxState {
                 thread_id,
                 messages,
             } => {
+                self.prefetching_threads.remove(&thread_id);
+                if !messages.is_empty() {
+                    self.cache_conversation(thread_id.clone(), messages.clone());
+                }
                 if self.active_thread_op != Some(op_id)
                     || self.selected_thread.as_ref() != Some(&thread_id)
                 {
                     return Vec::new();
                 }
                 self.loading_conversation = false;
-                // Keep a bounded in-memory cache (64 threads) so hopping back
-                // and forth during triage is instantaneous.
-                if self.conversation_cache.len() >= 64 {
-                    self.conversation_cache.clear();
-                }
-                self.conversation_cache.insert(thread_id, messages.clone());
                 self.conversation = messages;
+                Vec::new()
+            }
+            InboxEvent::ConversationPrefetched {
+                thread_id,
+                messages,
+            } => {
+                self.prefetching_threads.remove(&thread_id);
+                if !messages.is_empty() {
+                    self.cache_conversation(thread_id.clone(), messages.clone());
+                }
+                if self.selected_thread.as_ref() == Some(&thread_id) && self.loading_conversation {
+                    self.active_thread_op = None;
+                    self.loading_conversation = false;
+                    self.conversation = messages;
+                }
+                Vec::new()
+            }
+            InboxEvent::PrefetchFailed { thread_id } => {
+                self.prefetching_threads.remove(&thread_id);
                 Vec::new()
             }
             InboxEvent::ArchiveSelected => {
@@ -225,16 +261,81 @@ impl InboxState {
             return Vec::new();
         }
         self.selected_thread = Some(thread_id.clone());
-        if let Some(cached) = self.conversation_cache.get(&thread_id) {
+        let selected_idx = self.threads.iter().position(|t| t.id == thread_id);
+
+        let mut effects = Vec::new();
+        if let Some(cached) = self.conversation_cache.get(&thread_id).cloned() {
+            self.touch_cache_key(&thread_id);
             self.active_thread_op = None;
             self.loading_conversation = false;
-            self.conversation = cached.clone();
+            self.conversation = cached;
+        } else {
+            self.conversation.clear();
+            let op_id = self.alloc_op();
+            self.active_thread_op = Some(op_id);
+            self.loading_conversation = true;
+            effects.push(InboxEffect::LoadConversation { op_id, thread_id });
+        }
+
+        if let Some(idx) = selected_idx {
+            effects.extend(self.prefetch_around(idx, NEIGHBOR_PREFETCH_COUNT));
+        }
+
+        effects
+    }
+
+    fn cache_conversation(&mut self, thread_id: ThreadId, messages: Vec<Message>) {
+        self.conversation_cache.insert(thread_id.clone(), messages);
+        self.touch_cache_key(&thread_id);
+        while self.conversation_cache.len() > CONVERSATION_CACHE_LIMIT {
+            if let Some(oldest) = self.conversation_cache_order.pop_front() {
+                self.conversation_cache.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn touch_cache_key(&mut self, thread_id: &ThreadId) {
+        if let Some(pos) = self
+            .conversation_cache_order
+            .iter()
+            .position(|id| id == thread_id)
+        {
+            self.conversation_cache_order.remove(pos);
+        }
+        self.conversation_cache_order.push_back(thread_id.clone());
+    }
+
+    fn prefetch_around(&mut self, center_idx: usize, max_count: usize) -> Vec<InboxEffect> {
+        if self.threads.is_empty() || max_count == 0 {
             return Vec::new();
         }
-        let op_id = self.alloc_op();
-        self.active_thread_op = Some(op_id);
-        self.loading_conversation = true;
-        vec![InboxEffect::LoadConversation { op_id, thread_id }]
+
+        let len = self.threads.len();
+        let offsets: [isize; 5] = [1, 2, -1, 3, 4];
+        let mut effects = Vec::new();
+
+        for offset in offsets {
+            if effects.len() >= max_count {
+                break;
+            }
+            let target = center_idx as isize + offset;
+            if target < 0 || target >= len as isize {
+                continue;
+            }
+            let thread_id = self.threads[target as usize].id.clone();
+            if self.selected_thread.as_ref() == Some(&thread_id)
+                || self.conversation_cache.contains_key(&thread_id)
+                || self.prefetching_threads.contains(&thread_id)
+            {
+                continue;
+            }
+            self.prefetching_threads.insert(thread_id.clone());
+            effects.push(InboxEffect::PrefetchConversation { thread_id });
+        }
+
+        effects
     }
 
     fn step_selection(&mut self, delta: isize) -> Vec<InboxEffect> {
@@ -485,5 +586,68 @@ mod tests {
 
         assert!(state.conversation.is_empty());
         assert!(state.loading_conversation);
+
+        // Returning to t-1 later should hit the cache immediately without another LoadConversation.
+        let back = state.handle(InboxEvent::SelectThread(ThreadId("t-1".into())));
+        assert!(!state.loading_conversation);
+        assert_eq!(state.conversation.len(), 1);
+        assert!(
+            !back
+                .iter()
+                .any(|e| matches!(e, InboxEffect::LoadConversation { .. }))
+        );
+    }
+
+    #[test]
+    fn prefetches_neighboring_threads_and_serves_cached_selection_instantly() {
+        let mut state = InboxState::new();
+        state.threads = vec![
+            sample_thread("t-1", "First"),
+            sample_thread("t-2", "Second"),
+            sample_thread("t-3", "Third"),
+        ];
+
+        let effects = state.handle(InboxEvent::SelectThread(ThreadId("t-1".into())));
+        assert!(effects.iter().any(|e| matches!(
+            e,
+            InboxEffect::PrefetchConversation { thread_id } if thread_id == &ThreadId("t-2".into())
+        )));
+        assert!(effects.iter().any(|e| matches!(
+            e,
+            InboxEffect::PrefetchConversation { thread_id } if thread_id == &ThreadId("t-3".into())
+        )));
+
+        // Prefetch completes in the background for t-2.
+        state.handle(InboxEvent::ConversationPrefetched {
+            thread_id: ThreadId("t-2".into()),
+            messages: vec![Message {
+                id: MessageId("m-2".into()),
+                thread_id: ThreadId("t-2".into()),
+                subject: "Second".into(),
+                from: vec![],
+                to: vec![],
+                cc: vec![],
+                received_at: Timestamp::UNIX_EPOCH,
+                unread: true,
+                text_body: Some("prefetched body".into()),
+                html_body: None,
+                attachments: vec![],
+                has_remote_images: false,
+            }],
+        });
+
+        // Stepping to t-2 is instantaneous: no LoadConversation effect emitted.
+        let next_effects = state.handle(InboxEvent::SelectNextThread);
+        assert!(!state.loading_conversation);
+        assert_eq!(state.conversation.len(), 1);
+        assert_eq!(
+            state.conversation[0].text_body.as_deref(),
+            Some("prefetched body")
+        );
+        assert!(
+            !next_effects
+                .iter()
+                .any(|e| matches!(e, InboxEffect::LoadConversation { .. }))
+        );
     }
 }
