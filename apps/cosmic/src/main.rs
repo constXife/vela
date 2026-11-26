@@ -109,6 +109,8 @@ struct App {
     inbox: InboxState,
     session: Option<Arc<JmapSession>>,
     cache: Option<Arc<VelaCache>>,
+    account: Option<(String, String)>,
+    syncing: bool,
 }
 
 type ConnectedAccount = (Arc<JmapSession>, Vec<Mailbox>);
@@ -164,6 +166,8 @@ enum Message {
     SearchChanged(String),
     SetFilter(ThreadFilter),
     ClearFilters,
+    SyncNow,
+    SyncMailboxesFinished(Result<Vec<Mailbox>, String>),
 }
 
 impl App {
@@ -340,12 +344,19 @@ impl cosmic::Application for App {
     }
 
     fn init(core: Core, flags: Self::Flags) -> (Self, Task<Self::Message>) {
+        let initial_account = if flags.sample_mode {
+            None
+        } else {
+            current_account_display()
+        };
         let mut app = Self {
             core,
             screen: Screen::Starting,
             inbox: InboxState::new(),
             session: None,
             cache: None,
+            account: initial_account,
+            syncing: !flags.sample_mode,
         };
 
         if flags.sample_mode {
@@ -440,6 +451,7 @@ impl cosmic::Application for App {
                     "e" => Some(Message::Archive),
                     "u" => Some(Message::ToggleRead),
                     "z" => Some(Message::Undo),
+                    "r" => Some(Message::SyncNow),
                     "/" => Some(Message::FocusSearch),
                     _ => None,
                 },
@@ -488,14 +500,19 @@ impl cosmic::Application for App {
                     });
                 }
                 self.session = Some(session);
+                self.account = current_account_display();
+                self.syncing = false;
                 self.screen = Screen::Inbox;
                 self.dispatch(InboxEvent::MailboxesLoaded(mailboxes))
             }
             Message::StartupResolved(Ok(None)) => {
+                self.syncing = false;
+                self.account = None;
                 self.screen = Screen::Connect(ConnectForm::from_saved_or_default());
                 Task::none()
             }
             Message::StartupResolved(Err(err)) => {
+                self.syncing = false;
                 if self.inbox.mailboxes.is_empty() {
                     let mut form = ConnectForm::from_saved_or_default();
                     form.error = Some(err);
@@ -568,6 +585,8 @@ impl cosmic::Application for App {
                     });
                 }
                 self.session = Some(session);
+                self.account = current_account_display();
+                self.syncing = false;
                 self.inbox = InboxState::new();
                 self.screen = Screen::Inbox;
                 let open_cache_task = if self.cache.is_none() {
@@ -604,6 +623,8 @@ impl cosmic::Application for App {
                 }
                 self.session = None;
                 self.cache = None;
+                self.account = None;
+                self.syncing = false;
                 self.inbox = InboxState::new();
                 self.screen = Screen::Inbox;
                 self.dispatch(InboxEvent::MailboxesLoaded(sample::mailboxes()))
@@ -611,6 +632,8 @@ impl cosmic::Application for App {
             Message::SignOut => {
                 self.session = None;
                 self.cache = None;
+                self.account = None;
+                self.syncing = false;
                 self.inbox = InboxState::new();
                 cosmic::task::future(async move {
                     let _ = store::clear_saved_secret().await;
@@ -707,6 +730,33 @@ impl cosmic::Application for App {
             }
             Message::SetFilter(filter) => self.dispatch(InboxEvent::SetFilter(filter)),
             Message::ClearFilters => self.dispatch(InboxEvent::ClearFilters),
+            Message::SyncNow => {
+                if self.syncing {
+                    return Task::none();
+                }
+                let Some(session) = self.session.clone() else {
+                    return Task::none();
+                };
+                self.syncing = true;
+                cosmic::task::future(async move {
+                    let result = session.list_mailboxes().await.map_err(|e| e.to_string());
+                    Message::SyncMailboxesFinished(result)
+                })
+            }
+            Message::SyncMailboxesFinished(Ok(mailboxes)) => {
+                self.syncing = false;
+                if let Some(cache) = self.cache.clone() {
+                    let mbs = mailboxes.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let _ = cache.save_mailboxes(&mbs);
+                    });
+                }
+                self.dispatch(InboxEvent::MailboxesLoaded(mailboxes))
+            }
+            Message::SyncMailboxesFinished(Err(err)) => {
+                self.syncing = false;
+                self.dispatch(InboxEvent::ReportError(format!("Sync failed: {err}")))
+            }
         }
     }
 
@@ -814,11 +864,35 @@ impl App {
     }
 
     fn view_mailboxes(&self) -> Element<'_, Message> {
-        let header = widget::container(widget::text::title4("Mailboxes"))
-            .padding([0, 16])
-            .align_y(Alignment::Center)
-            .height(Length::Fixed(52.0))
-            .width(Length::Fill);
+        let is_syncing = self.syncing || self.inbox.loading_threads;
+        let sync_tooltip = if is_syncing {
+            "Syncing…"
+        } else if self.session.is_some() {
+            "Sync now (R)"
+        } else {
+            "Sample mode"
+        };
+        let mut sync_btn =
+            widget::button::icon(widget::icon::from_name("view-refresh-symbolic")).padding(6);
+        if self.session.is_some() && !is_syncing {
+            sync_btn = sync_btn.on_press(Message::SyncNow);
+        }
+
+        let header = widget::container(
+            widget::row::with_capacity(3)
+                .push(widget::text::title4("Mailboxes"))
+                .push(widget::space::horizontal())
+                .push(widget::tooltip(
+                    sync_btn,
+                    widget::text::caption(sync_tooltip),
+                    widget::tooltip::Position::Bottom,
+                ))
+                .align_y(Alignment::Center),
+        )
+        .padding([0, 12, 0, 16])
+        .align_y(Alignment::Center)
+        .height(Length::Fixed(52.0))
+        .width(Length::Fill);
 
         let mut list = widget::column::with_capacity(self.inbox.mailboxes.len())
             .spacing(4)
@@ -851,13 +925,34 @@ impl App {
             list = list.push(btn);
         }
 
-        let footer_label = if self.session.is_some() {
+        let footer_label = if self.session.is_some() || self.account.is_some() {
             "Sign out"
         } else {
             "Sign in…"
         };
-        let mut footer_col = widget::column::with_capacity(2).spacing(2);
-        if self.session.is_none() {
+        let mut footer_col = widget::column::with_capacity(3).spacing(2);
+        if let Some((user, host)) = &self.account {
+            let sub = if is_syncing {
+                "Syncing…".to_string()
+            } else {
+                host.clone()
+            };
+            footer_col = footer_col.push(
+                widget::container(
+                    widget::column::with_capacity(2)
+                        .spacing(1)
+                        .push(
+                            widget::text::caption(html::clean_snippet(user, 24))
+                                .class(cosmic::theme::Text::Custom(primary_text_style)),
+                        )
+                        .push(
+                            widget::text::caption(html::clean_snippet(&sub, 24))
+                                .class(cosmic::theme::Text::Custom(muted_text_style)),
+                        ),
+                )
+                .padding([4, 10, 4, 10]),
+            );
+        } else {
             footer_col = footer_col.push(
                 widget::container(
                     widget::text::caption("Sample mode")
@@ -1438,6 +1533,18 @@ impl App {
             .height(Length::Fill)
             .into()
     }
+}
+
+fn current_account_display() -> Option<(String, String)> {
+    let cfg = store::load_account_config().ok().flatten()?;
+    let host = cfg
+        .server_url
+        .trim()
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_end_matches('/')
+        .to_string();
+    Some((cfg.username, host))
 }
 
 fn search_input_id() -> widget::Id {
