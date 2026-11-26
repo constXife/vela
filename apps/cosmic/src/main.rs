@@ -114,6 +114,7 @@ struct App {
     syncing: bool,
     downloading_blobs: HashSet<BlobId>,
     last_saved_attachment: Option<PathBuf>,
+    show_shortcuts: bool,
 }
 
 type ConnectedAccount = (Arc<JmapSession>, Vec<Mailbox>);
@@ -177,6 +178,9 @@ enum Message {
         result: Result<PathBuf, String>,
     },
     OpenSavedAttachment(PathBuf),
+    ToggleShortcuts,
+    CloseShortcuts,
+    EscapePressed,
 }
 
 impl App {
@@ -368,6 +372,7 @@ impl cosmic::Application for App {
             syncing: !flags.sample_mode,
             downloading_blobs: HashSet::new(),
             last_saved_attachment: None,
+            show_shortcuts: false,
         };
 
         if flags.sample_mode {
@@ -455,7 +460,7 @@ impl cosmic::Application for App {
                 keyboard::Key::Named(
                     keyboard::key::Named::Delete | keyboard::key::Named::Backspace,
                 ) => Some(Message::Trash),
-                keyboard::Key::Named(keyboard::key::Named::Escape) => Some(Message::ClearFilters),
+                keyboard::Key::Named(keyboard::key::Named::Escape) => Some(Message::EscapePressed),
                 keyboard::Key::Character(ref c) => match c.as_str() {
                     "j" => Some(Message::SelectNext),
                     "k" => Some(Message::SelectPrev),
@@ -464,6 +469,7 @@ impl cosmic::Application for App {
                     "z" => Some(Message::Undo),
                     "r" => Some(Message::SyncNow),
                     "/" => Some(Message::FocusSearch),
+                    "?" => Some(Message::ToggleShortcuts),
                     _ => None,
                 },
                 _ => None,
@@ -820,6 +826,32 @@ impl cosmic::Application for App {
                 }
                 Task::none()
             }
+            Message::ToggleShortcuts => {
+                self.show_shortcuts = !self.show_shortcuts;
+                Task::none()
+            }
+            Message::CloseShortcuts => {
+                self.show_shortcuts = false;
+                Task::none()
+            }
+            Message::EscapePressed => {
+                if self.show_shortcuts {
+                    self.show_shortcuts = false;
+                    Task::none()
+                } else if self.inbox.has_active_filter() {
+                    self.dispatch(InboxEvent::ClearFilters)
+                } else {
+                    Task::none()
+                }
+            }
+        }
+    }
+
+    fn dialog(&self) -> Option<Element<'_, Self::Message>> {
+        if self.show_shortcuts {
+            Some(self.view_shortcuts_dialog())
+        } else {
+            None
         }
     }
 
@@ -835,6 +867,43 @@ impl cosmic::Application for App {
 }
 
 impl App {
+    fn view_shortcuts_dialog(&self) -> Element<'_, Message> {
+        let content = widget::column::with_capacity(6)
+            .spacing(12)
+            .push(shortcut_section(
+                "Navigation",
+                &[
+                    ("j  /  ↓", "Next conversation"),
+                    ("k  /  ↑", "Previous conversation"),
+                ],
+            ))
+            .push(widget::divider::horizontal::light())
+            .push(shortcut_section(
+                "Triage",
+                &[
+                    ("E", "Archive conversation"),
+                    ("Del  /  Backspace", "Move to Trash"),
+                    ("U", "Toggle Read / Unread"),
+                    ("Z", "Undo last triage action"),
+                ],
+            ))
+            .push(widget::divider::horizontal::light())
+            .push(shortcut_section(
+                "Search & Global",
+                &[
+                    ("/", "Focus search bar"),
+                    ("R", "Sync mailboxes & threads"),
+                    ("Esc", "Close dialog / clear filters"),
+                    ("?", "Toggle this shortcuts overlay"),
+                ],
+            ));
+
+        widget::dialog()
+            .title("Keyboard Shortcuts")
+            .control(content)
+            .primary_action(widget::button::suggested("Close").on_press(Message::CloseShortcuts))
+            .into()
+    }
     fn view_connect<'a>(&self, form: &'a ConnectForm) -> Element<'a, Message> {
         let mut card = widget::column::with_capacity(8)
             .spacing(12)
@@ -1833,4 +1902,31 @@ fn save_to_downloads(raw_name: &str, bytes: &[u8]) -> Result<PathBuf, String> {
 
     std::fs::write(&dest, bytes).map_err(|e| e.to_string())?;
     Ok(dest)
+}
+
+fn shortcut_section<'a>(title: &'a str, entries: &[(&'a str, &'a str)]) -> Element<'a, Message> {
+    let mut col = widget::column::with_capacity(entries.len() + 1)
+        .spacing(6)
+        .push(
+            widget::text::caption_heading(title)
+                .class(cosmic::theme::Text::Custom(muted_text_style)),
+        );
+
+    for &(keys, desc) in entries {
+        let keycap = widget::container(
+            widget::text::caption(keys).class(cosmic::theme::Text::Custom(primary_text_style)),
+        )
+        .padding([3, 8])
+        .class(cosmic::theme::Container::Primary);
+
+        let row = widget::row::with_capacity(3)
+            .push(widget::text::body(desc))
+            .push(widget::space::horizontal())
+            .push(keycap)
+            .align_y(Alignment::Center)
+            .spacing(16);
+        col = col.push(row);
+    }
+
+    col.into()
 }
