@@ -8,6 +8,7 @@
 # Options:
 #   --sample         Launch Vela in sample mode (default)
 #   --live           Launch Vela with the saved JMAP account
+#   --click X,Y      Click at window/output coordinates via sway seat (repeatable)
 #   --keys KEYS      Comma-separated keys to send via wtype (e.g. "j,e")
 #   --size WxH       Headless output resolution (default: 1280x760)
 #   --wait SECS      Extra settle delay before capture (default: 1.0)
@@ -15,6 +16,7 @@
 set -euo pipefail
 
 MODE="--sample"
+CLICKS=()
 KEYS=""
 SIZE="1280x760"
 WAIT_SECS="1.0"
@@ -29,6 +31,10 @@ while [[ $# -gt 0 ]]; do
         --live)
             MODE=""
             shift
+            ;;
+        --click)
+            CLICKS+=("${2:?missing value for --click (expected X,Y)}")
+            shift 2
             ;;
         --keys)
             KEYS="${2:?missing value for --keys}"
@@ -94,7 +100,7 @@ for _ in \$(seq 1 75); do
         cat "$TMPDIR/vela.log" >&2
         exit 1
     fi
-    if swaymsg -t get_tree 2>/dev/null | grep -q '"app_id"'; then
+    if swaymsg -t get_tree 2>/dev/null | grep -q '"com.rlyeh.vela.Cosmic"'; then
         break
     fi
     sleep 0.2
@@ -102,12 +108,26 @@ done
 
 sleep "$WAIT_SECS"
 
+CLICKS_SERIALIZED="${CLICKS[*]:-}"
+if [[ -n "\$CLICKS_SERIALIZED" ]]; then
+    for pt in \$CLICKS_SERIALIZED; do
+        cx="\${pt%,*}"
+        cy="\${pt#*,}"
+        swaymsg seat seat0 cursor set "\$cx" "\$cy" >/dev/null 2>&1 || true
+        sleep 0.1
+        wlrctl pointer move 1 1 || true
+        sleep 0.1
+        wlrctl pointer click left || true
+        sleep 0.4
+    done
+fi
+
 if [[ -n "$KEYS" ]]; then
     swaymsg '[app_id=".*"] focus' >/dev/null 2>&1 || true
     sleep 0.2
     IFS=',' read -ra KEY_LIST <<< "$KEYS"
     for k in "\${KEY_LIST[@]}"; do
-        wtype "\$k"
+        wtype -s 200 -d 100 "\$k"
         sleep 0.4
     done
     sleep 0.3

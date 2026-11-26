@@ -727,7 +727,8 @@ impl App {
                 }
 
                 let sender_widget = if thread.unread {
-                    widget::text::heading(sender_display)
+                    widget::text::body(sender_display)
+                        .font(cosmic::font::bold())
                         .class(cosmic::theme::Text::Custom(primary_text_style))
                 } else {
                     widget::text::body(sender_display)
@@ -788,10 +789,16 @@ impl App {
 
                 list = list.push(btn);
 
-                if idx + 1 < thread_count && !selected && !next_selected {
-                    list = list.push(
-                        widget::container(widget::divider::horizontal::light()).padding([0, 12]),
-                    );
+                if idx + 1 < thread_count {
+                    let sep: Element<'_, Message> = if !selected && !next_selected {
+                        widget::container(widget::divider::horizontal::light())
+                            .padding([0, 12])
+                            .height(Length::Fixed(1.0))
+                            .into()
+                    } else {
+                        widget::space::vertical().height(Length::Fixed(1.0)).into()
+                    };
+                    list = list.push(sep);
                 }
             }
         }

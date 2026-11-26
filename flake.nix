@@ -49,6 +49,7 @@
             sway
             grim
             wtype
+            wlrctl
           ]
           ++ runtimeLibs;
 
