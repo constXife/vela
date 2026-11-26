@@ -99,6 +99,7 @@ enum SettingsTab {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ThreadMenuAction {
+    OpenInNewWindow(usize),
     ToggleRead(usize),
     ToggleFlag(usize),
     Archive(usize),
@@ -117,9 +118,9 @@ impl menu::Action for ThreadMenuAction {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CopyMessageField {
-    Body(usize),
-    Sender(usize),
-    Subject(usize),
+    Body(Option<window::Id>, usize),
+    Sender(Option<window::Id>, usize),
+    Subject(Option<window::Id>, usize),
 }
 
 impl menu::Action for CopyMessageField {
@@ -128,6 +129,26 @@ impl menu::Action for CopyMessageField {
     fn message(&self) -> Self::Message {
         Message::CopyMessageAction(*self)
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ThreadWindowAction {
+    Archive,
+    RestoreToInbox,
+    ToggleRead,
+    ToggleFlag,
+    Trash,
+}
+
+struct ThreadWindowState {
+    thread_id: ThreadId,
+    subject: String,
+    unread: bool,
+    flagged: bool,
+    mailbox_role: Option<MailboxRole>,
+    messages: Vec<MailMessage>,
+    loading: bool,
+    body_editors: HashMap<MessageId, widget::text_editor::Content>,
 }
 
 struct ConnectForm {
@@ -225,6 +246,8 @@ struct App {
     resizing: Option<ResizeHandle>,
     auto_mark_read: bool,
     body_editors: HashMap<MessageId, widget::text_editor::Content>,
+    thread_windows: HashMap<window::Id, ThreadWindowState>,
+    last_thread_click: Option<(ThreadId, std::time::Instant)>,
 }
 
 type ConnectedAccount = (String, Arc<JmapSession>, Vec<Mailbox>, String);
@@ -328,6 +351,15 @@ enum Message {
     ThreadContextAction(ThreadMenuAction),
     CopyMessageAction(CopyMessageField),
     BodyEditorAction(MessageId, widget::text_editor::Action),
+    ThreadWindowOpened,
+    ThreadWindowLoaded {
+        window_id: window::Id,
+        result: Result<Vec<MailMessage>, String>,
+    },
+    CloseThreadWindow(window::Id),
+    DragThreadWindow(window::Id),
+    ThreadWindowBodyAction(window::Id, MessageId, widget::text_editor::Action),
+    ThreadWindowTriage(window::Id, ThreadWindowAction),
 }
 
 impl App {
@@ -369,6 +401,110 @@ impl App {
         });
         self.settings_window = Some(id);
         spawn_window.map(|opened_id| cosmic::Action::App(Message::SettingsWindowOpened(opened_id)))
+    }
+
+    fn open_thread_window(&mut self, thread_id: ThreadId) -> Task<Message> {
+        if let Some((&existing_id, _)) = self
+            .thread_windows
+            .iter()
+            .find(|(_, state)| state.thread_id == thread_id)
+        {
+            return window::gain_focus(existing_id);
+        }
+
+        let summary = self
+            .inbox
+            .threads
+            .iter()
+            .find(|t| t.id == thread_id)
+            .cloned();
+        let mailbox_role = self
+            .inbox
+            .selected_mailbox
+            .as_ref()
+            .and_then(|id| self.inbox.mailboxes.iter().find(|mb| &mb.id == id))
+            .map(|mb| mb.role);
+
+        let initial_messages = if self.inbox.selected_thread.as_ref() == Some(&thread_id)
+            && !self.inbox.conversation.is_empty()
+        {
+            self.inbox.conversation.clone()
+        } else if let Some(cache) = &self.cache
+            && let Ok(Some(msgs)) = cache.load_conversation(&thread_id)
+        {
+            msgs
+        } else if self.session.is_none() && self.cache.is_none() {
+            sample::messages_for_thread(&thread_id)
+        } else {
+            Vec::new()
+        };
+
+        let subject = initial_messages
+            .first()
+            .map(|m| m.subject.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| {
+                summary
+                    .as_ref()
+                    .map(|s| s.subject.as_str())
+                    .filter(|s| !s.trim().is_empty())
+            })
+            .unwrap_or("(No subject)")
+            .to_string();
+        let unread = summary.as_ref().is_some_and(|s| s.unread);
+        let flagged = summary.as_ref().is_some_and(|s| s.flagged);
+        let loading = initial_messages.is_empty();
+        let body_editors = build_body_editors(&initial_messages);
+
+        let (win_id, spawn_window) = window::open(window::Settings {
+            size: Size::new(820.0, 680.0),
+            min_size: Some(Size::new(560.0, 420.0)),
+            exit_on_close_request: false,
+            decorations: false,
+            transparent: false,
+            ..Default::default()
+        });
+
+        self.thread_windows.insert(
+            win_id,
+            ThreadWindowState {
+                thread_id: thread_id.clone(),
+                subject,
+                unread,
+                flagged,
+                mailbox_role,
+                messages: initial_messages,
+                loading,
+                body_editors,
+            },
+        );
+
+        let open_task = spawn_window.map(|_| cosmic::Action::App(Message::ThreadWindowOpened));
+
+        if loading && let Some(session) = self.session.clone() {
+            let fetch_task = cosmic::task::future(async move {
+                let result = session
+                    .load_conversation(&thread_id)
+                    .await
+                    .map_err(|e| e.to_string());
+                Message::ThreadWindowLoaded {
+                    window_id: win_id,
+                    result,
+                }
+            });
+            Task::batch([open_task, fetch_task])
+        } else {
+            open_task
+        }
+    }
+
+    fn close_all_thread_windows(&mut self) -> Task<Message> {
+        let ids: Vec<window::Id> = self.thread_windows.drain().map(|(id, _)| id).collect();
+        if ids.is_empty() {
+            Task::none()
+        } else {
+            Task::batch(ids.into_iter().map(window::close))
+        }
     }
 
     fn sync_body_editors(&mut self) {
@@ -625,6 +761,8 @@ impl cosmic::Application for App {
             resizing: None,
             auto_mark_read: false,
             body_editors: HashMap::new(),
+            thread_windows: HashMap::new(),
+            last_thread_click: None,
         };
 
         if flags.sample_mode {
@@ -933,8 +1071,10 @@ impl cosmic::Application for App {
                 self.sync_states = SyncStates::default();
                 self.inbox = InboxState::new();
                 self.body_editors.clear();
+                let close_windows = self.close_all_thread_windows();
                 self.screen = Screen::Inbox;
-                self.dispatch(InboxEvent::MailboxesLoaded(sample::mailboxes()))
+                let load = self.dispatch(InboxEvent::MailboxesLoaded(sample::mailboxes()));
+                Task::batch([close_windows, load])
             }
             Message::OpenAddAccount => {
                 self.add_account_form.error = None;
@@ -942,7 +1082,7 @@ impl cosmic::Application for App {
             }
             Message::RemoveAccount(account_id) => {
                 let was_active = self.active_account_id.as_deref() == Some(account_id.as_str());
-                if was_active {
+                let close_windows = if was_active {
                     self.active_account_id = None;
                     self.session = None;
                     self.cache = None;
@@ -950,15 +1090,19 @@ impl cosmic::Application for App {
                     self.sync_states = SyncStates::default();
                     self.inbox = InboxState::new();
                     self.body_editors.clear();
-                }
-                cosmic::task::future(async move {
+                    self.close_all_thread_windows()
+                } else {
+                    Task::none()
+                };
+                let remove_task = cosmic::task::future(async move {
                     let next = store::remove_account(&account_id).await.ok().flatten();
                     let _ = tokio::task::spawn_blocking(move || {
                         vela_cache::destroy_account_cache(&account_id)
                     })
                     .await;
                     Message::SignedOut(if was_active { next } else { None })
-                })
+                });
+                Task::batch([close_windows, remove_task])
             }
             Message::SwitchAccount(account_id) => {
                 if self.active_account_id.as_deref() == Some(account_id.as_str())
@@ -974,8 +1118,9 @@ impl cosmic::Application for App {
                 self.sync_states = SyncStates::default();
                 self.inbox = InboxState::new();
                 self.body_editors.clear();
+                let close_windows = self.close_all_thread_windows();
                 self.screen = Screen::Inbox;
-                spawn_account_load_tasks(account_id)
+                Task::batch([close_windows, spawn_account_load_tasks(account_id)])
             }
             Message::SignOut => {
                 let removing = self.active_account_id.take();
@@ -985,7 +1130,8 @@ impl cosmic::Application for App {
                 self.sync_states = SyncStates::default();
                 self.inbox = InboxState::new();
                 self.body_editors.clear();
-                cosmic::task::future(async move {
+                let close_windows = self.close_all_thread_windows();
+                let signout_task = cosmic::task::future(async move {
                     let next_active = if let Some(account_id) = removing {
                         let next = store::remove_account(&account_id).await.ok().flatten();
                         let _ = tokio::task::spawn_blocking(move || {
@@ -1001,7 +1147,8 @@ impl cosmic::Application for App {
                         None
                     };
                     Message::SignedOut(next_active)
-                })
+                });
+                Task::batch([close_windows, signout_task])
             }
             Message::SignedOut(next_account_id) => {
                 self.refresh_accounts_from_disk();
@@ -1050,6 +1197,19 @@ impl cosmic::Application for App {
                 Err(err) => self.dispatch(InboxEvent::ReportError(err)),
             },
             Message::SelectThread(id) => {
+                let is_double_click =
+                    self.last_thread_click
+                        .as_ref()
+                        .is_some_and(|(prev_id, prev_time)| {
+                            prev_id == &id
+                                && prev_time.elapsed() <= std::time::Duration::from_millis(400)
+                        });
+                if is_double_click {
+                    self.last_thread_click = None;
+                    return self.open_thread_window(id);
+                }
+                self.last_thread_click = Some((id.clone(), std::time::Instant::now()));
+
                 let mut tasks = vec![self.dispatch(InboxEvent::SelectThread(id))];
                 if self.auto_mark_read && self.selected_thread_is_unread() {
                     tasks.push(self.dispatch(InboxEvent::ToggleSelectedRead));
@@ -1083,6 +1243,13 @@ impl cosmic::Application for App {
                             let _ = cache.save_conversation(&tid, &msgs);
                         });
                     }
+                    for state in self.thread_windows.values_mut() {
+                        if state.thread_id == thread_id && state.messages.is_empty() {
+                            state.body_editors = build_body_editors(&messages);
+                            state.messages = messages.clone();
+                            state.loading = false;
+                        }
+                    }
                     self.dispatch(InboxEvent::ConversationLoaded {
                         op_id,
                         thread_id,
@@ -1099,6 +1266,13 @@ impl cosmic::Application for App {
                         tokio::task::spawn_blocking(move || {
                             let _ = cache.save_conversation(&tid, &msgs);
                         });
+                    }
+                    for state in self.thread_windows.values_mut() {
+                        if state.thread_id == thread_id && state.messages.is_empty() {
+                            state.body_editors = build_body_editors(&messages);
+                            state.messages = messages.clone();
+                            state.loading = false;
+                        }
                     }
                     self.dispatch(InboxEvent::ConversationPrefetched {
                         thread_id,
@@ -1394,7 +1568,8 @@ impl cosmic::Application for App {
             }
             Message::ThreadContextAction(action) => {
                 let idx = match action {
-                    ThreadMenuAction::ToggleRead(i)
+                    ThreadMenuAction::OpenInNewWindow(i)
+                    | ThreadMenuAction::ToggleRead(i)
                     | ThreadMenuAction::ToggleFlag(i)
                     | ThreadMenuAction::Archive(i)
                     | ThreadMenuAction::RestoreToInbox(i)
@@ -1404,6 +1579,9 @@ impl cosmic::Application for App {
                 let Some(thread) = self.inbox.threads.get(idx).cloned() else {
                     return Task::none();
                 };
+                if let ThreadMenuAction::OpenInNewWindow(_) = action {
+                    return self.open_thread_window(thread.id);
+                }
                 if let ThreadMenuAction::CopySubject(_) = action {
                     return self.update(Message::CopyToClipboard {
                         text: thread.subject,
@@ -1423,21 +1601,30 @@ impl cosmic::Application for App {
                         self.dispatch(InboxEvent::MoveSelectedToInbox)
                     }
                     ThreadMenuAction::Trash(_) => self.dispatch(InboxEvent::TrashSelected),
-                    ThreadMenuAction::CopySubject(_) => Task::none(),
+                    ThreadMenuAction::OpenInNewWindow(_) | ThreadMenuAction::CopySubject(_) => {
+                        Task::none()
+                    }
                 };
                 Task::batch([select_task, action_task])
             }
             Message::CopyMessageAction(action) => {
-                let idx = match action {
-                    CopyMessageField::Body(i)
-                    | CopyMessageField::Sender(i)
-                    | CopyMessageField::Subject(i) => i,
+                let (win_id, idx) = match action {
+                    CopyMessageField::Body(w, i)
+                    | CopyMessageField::Sender(w, i)
+                    | CopyMessageField::Subject(w, i) => (w, i),
                 };
-                let Some(msg) = self.inbox.conversation.get(idx) else {
+                let msg = match win_id {
+                    None => self.inbox.conversation.get(idx),
+                    Some(id) => self
+                        .thread_windows
+                        .get(&id)
+                        .and_then(|state| state.messages.get(idx)),
+                };
+                let Some(msg) = msg else {
                     return Task::none();
                 };
                 match action {
-                    CopyMessageField::Body(_) => {
+                    CopyMessageField::Body(_, _) => {
                         let prepared =
                             html::prepare_body(msg.text_body.as_deref(), msg.html_body.as_deref());
                         self.update(Message::CopyToClipboard {
@@ -1445,14 +1632,14 @@ impl cosmic::Application for App {
                             label: "message text",
                         })
                     }
-                    CopyMessageField::Sender(_) => {
+                    CopyMessageField::Sender(_, _) => {
                         let sender = format_address_list(&msg.from);
                         self.update(Message::CopyToClipboard {
                             text: sender,
                             label: "sender address",
                         })
                     }
-                    CopyMessageField::Subject(_) => self.update(Message::CopyToClipboard {
+                    CopyMessageField::Subject(_, _) => self.update(Message::CopyToClipboard {
                         text: msg.subject.clone(),
                         label: "subject",
                     }),
@@ -1465,6 +1652,140 @@ impl cosmic::Application for App {
                     content.perform(action);
                 }
                 Task::none()
+            }
+            Message::ThreadWindowOpened => Task::none(),
+            Message::ThreadWindowLoaded { window_id, result } => {
+                if let Some(state) = self.thread_windows.get_mut(&window_id) {
+                    state.loading = false;
+                    match result {
+                        Ok(messages) => {
+                            if let Some(first) = messages.first()
+                                && !first.subject.trim().is_empty()
+                            {
+                                state.subject = first.subject.clone();
+                            }
+                            if let Some(cache) = self.cache.clone() {
+                                let tid = state.thread_id.clone();
+                                let msgs = messages.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    let _ = cache.save_conversation(&tid, &msgs);
+                                });
+                            }
+                            state.body_editors = build_body_editors(&messages);
+                            state.messages = messages;
+                        }
+                        Err(err) => {
+                            self.inbox.status_banner = Some(err);
+                        }
+                    }
+                }
+                Task::none()
+            }
+            Message::CloseThreadWindow(window_id) => {
+                self.thread_windows.remove(&window_id);
+                window::close(window_id)
+            }
+            Message::DragThreadWindow(window_id) => window::drag(window_id),
+            Message::ThreadWindowBodyAction(window_id, msg_id, action) => {
+                if !action.is_edit()
+                    && let Some(state) = self.thread_windows.get_mut(&window_id)
+                    && let Some(content) = state.body_editors.get_mut(&msg_id)
+                {
+                    content.perform(action);
+                }
+                Task::none()
+            }
+            Message::ThreadWindowTriage(window_id, action) => {
+                let Some(state) = self.thread_windows.get(&window_id) else {
+                    return Task::none();
+                };
+                let thread_id = state.thread_id.clone();
+                let in_current_list = self.inbox.threads.iter().any(|t| t.id == thread_id);
+
+                let close_after = matches!(
+                    action,
+                    ThreadWindowAction::Archive
+                        | ThreadWindowAction::RestoreToInbox
+                        | ThreadWindowAction::Trash
+                );
+
+                let triage_task = if in_current_list {
+                    let select_task = self.dispatch(InboxEvent::SelectThread(thread_id.clone()));
+                    let act_task = match action {
+                        ThreadWindowAction::Archive => self.dispatch(InboxEvent::ArchiveSelected),
+                        ThreadWindowAction::RestoreToInbox => {
+                            self.dispatch(InboxEvent::MoveSelectedToInbox)
+                        }
+                        ThreadWindowAction::ToggleRead => {
+                            self.dispatch(InboxEvent::ToggleSelectedRead)
+                        }
+                        ThreadWindowAction::ToggleFlag => {
+                            self.dispatch(InboxEvent::ToggleSelectedFlag)
+                        }
+                        ThreadWindowAction::Trash => self.dispatch(InboxEvent::TrashSelected),
+                    };
+                    if let Some(updated) = self.inbox.threads.iter().find(|t| t.id == thread_id)
+                        && let Some(win) = self.thread_windows.get_mut(&window_id)
+                    {
+                        win.unread = updated.unread;
+                        win.flagged = updated.flagged;
+                    }
+                    Task::batch([select_task, act_task])
+                } else {
+                    if let Some(win) = self.thread_windows.get_mut(&window_id) {
+                        match action {
+                            ThreadWindowAction::ToggleRead => win.unread = !win.unread,
+                            ThreadWindowAction::ToggleFlag => win.flagged = !win.flagged,
+                            _ => {}
+                        }
+                    }
+                    let mutation = match action {
+                        ThreadWindowAction::Archive => self
+                            .inbox
+                            .mailboxes
+                            .iter()
+                            .find(|m| m.role == MailboxRole::Archive)
+                            .map(|m| ThreadMutation::MoveToMailbox(m.id.clone())),
+                        ThreadWindowAction::RestoreToInbox => self
+                            .inbox
+                            .mailboxes
+                            .iter()
+                            .find(|m| m.role == MailboxRole::Inbox)
+                            .map(|m| ThreadMutation::MoveToMailbox(m.id.clone())),
+                        ThreadWindowAction::Trash => self
+                            .inbox
+                            .mailboxes
+                            .iter()
+                            .find(|m| m.role == MailboxRole::Trash)
+                            .map(|m| ThreadMutation::MoveToMailbox(m.id.clone())),
+                        ThreadWindowAction::ToggleRead => self
+                            .thread_windows
+                            .get(&window_id)
+                            .map(|w| ThreadMutation::SetUnread(w.unread)),
+                        ThreadWindowAction::ToggleFlag => self
+                            .thread_windows
+                            .get(&window_id)
+                            .map(|w| ThreadMutation::SetFlagged(w.flagged)),
+                    };
+                    if let (Some(session), Some(mutation)) = (self.session.clone(), mutation) {
+                        cosmic::task::future(async move {
+                            let result = session
+                                .mutate_thread(&thread_id, mutation)
+                                .await
+                                .map_err(|e| e.to_string());
+                            Message::TriageFinished(result)
+                        })
+                    } else {
+                        Task::none()
+                    }
+                };
+
+                if close_after {
+                    self.thread_windows.remove(&window_id);
+                    Task::batch([triage_task, window::close(window_id)])
+                } else {
+                    triage_task
+                }
             }
         }
     }
@@ -1507,6 +1828,8 @@ impl cosmic::Application for App {
     fn on_close_requested(&self, id: window::Id) -> Option<Self::Message> {
         if self.settings_window == Some(id) {
             Some(Message::CloseSettings)
+        } else if self.thread_windows.contains_key(&id) {
+            Some(Message::CloseThreadWindow(id))
         } else {
             None
         }
@@ -1533,6 +1856,8 @@ impl cosmic::Application for App {
     fn view_window(&self, id: window::Id) -> Element<'_, Self::Message> {
         if self.settings_window == Some(id) {
             self.view_settings_window()
+        } else if let Some(state) = self.thread_windows.get(&id) {
+            self.view_thread_window(id, state)
         } else {
             widget::container(widget::text::body("Unknown window"))
                 .center(Length::Fill)
@@ -2386,6 +2711,12 @@ impl App {
                     .unwrap_or(idx);
                 let mut menu_items = vec![
                     menu::Item::Button(
+                        "Open in new window",
+                        None,
+                        ThreadMenuAction::OpenInNewWindow(real_idx),
+                    ),
+                    menu::Item::Divider,
+                    menu::Item::Button(
                         if thread.unread {
                             "Mark read"
                         } else {
@@ -2665,21 +2996,185 @@ impl App {
                 .into();
         }
 
-        let thread_subject = self
-            .inbox
-            .conversation
+        let content = self.view_message_cards(&self.inbox.conversation, &self.body_editors, None);
+
+        widget::column::with_capacity(3)
+            .push(toolbar)
+            .push(widget::divider::horizontal::default())
+            .push(
+                widget::scrollable(content)
+                    .width(Length::Fill)
+                    .height(Length::Fill),
+            )
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+    }
+
+    fn view_thread_window<'a>(
+        &'a self,
+        win_id: window::Id,
+        state: &'a ThreadWindowState,
+    ) -> Element<'a, Message> {
+        let title_snippet = html::clean_snippet(&state.subject, 52);
+        let header = widget::header_bar()
+            .title(title_snippet)
+            .on_drag(Message::DragThreadWindow(win_id))
+            .on_close(Message::CloseThreadWindow(win_id));
+
+        let live_summary = self.inbox.threads.iter().find(|t| t.id == state.thread_id);
+        let is_unread = live_summary.map(|t| t.unread).unwrap_or(state.unread);
+        let is_flagged = live_summary.map(|t| t.flagged).unwrap_or(state.flagged);
+
+        let read_label = if is_unread {
+            "Mark read"
+        } else {
+            "Mark unread"
+        };
+        let read_icon = if is_unread {
+            "mail-mark-read-symbolic"
+        } else {
+            "mail-mark-unread-symbolic"
+        };
+        let flag_label = if is_flagged { "Unflag" } else { "Flag" };
+
+        let mut toolbar_row = widget::row::with_capacity(6)
+            .spacing(8)
+            .align_y(Alignment::Center);
+
+        match state.mailbox_role {
+            Some(MailboxRole::Trash | MailboxRole::Junk) => {
+                toolbar_row = toolbar_row.push(
+                    widget::button::standard("Restore to Inbox")
+                        .leading_icon(
+                            widget::icon::from_name("mail-folder-inbox-symbolic").handle(),
+                        )
+                        .on_press(Message::ThreadWindowTriage(
+                            win_id,
+                            ThreadWindowAction::RestoreToInbox,
+                        )),
+                );
+            }
+            Some(MailboxRole::Archive) => {
+                toolbar_row = toolbar_row.push(
+                    widget::button::standard("Move to Inbox")
+                        .leading_icon(
+                            widget::icon::from_name("mail-folder-inbox-symbolic").handle(),
+                        )
+                        .on_press(Message::ThreadWindowTriage(
+                            win_id,
+                            ThreadWindowAction::RestoreToInbox,
+                        )),
+                );
+            }
+            _ => {
+                toolbar_row = toolbar_row.push(
+                    widget::button::standard("Archive")
+                        .leading_icon(widget::icon::from_name("mail-archive-symbolic").handle())
+                        .on_press(Message::ThreadWindowTriage(
+                            win_id,
+                            ThreadWindowAction::Archive,
+                        )),
+                );
+            }
+        }
+
+        toolbar_row = toolbar_row
+            .push(
+                widget::button::standard(read_label)
+                    .leading_icon(widget::icon::from_name(read_icon).handle())
+                    .on_press(Message::ThreadWindowTriage(
+                        win_id,
+                        ThreadWindowAction::ToggleRead,
+                    )),
+            )
+            .push(
+                widget::button::standard(flag_label)
+                    .leading_icon(widget::icon::from_name("insert-star-symbolic").handle())
+                    .on_press(Message::ThreadWindowTriage(
+                        win_id,
+                        ThreadWindowAction::ToggleFlag,
+                    )),
+            )
+            .push(widget::space::horizontal());
+
+        if state.mailbox_role != Some(MailboxRole::Trash) {
+            toolbar_row = toolbar_row.push(
+                widget::button::standard("Trash")
+                    .leading_icon(widget::icon::from_name("user-trash-symbolic").handle())
+                    .on_press(Message::ThreadWindowTriage(
+                        win_id,
+                        ThreadWindowAction::Trash,
+                    )),
+            );
+        }
+
+        let toolbar = widget::container(toolbar_row)
+            .padding([0, 20])
+            .align_y(Alignment::Center)
+            .height(Length::Fixed(52.0))
+            .width(Length::Fill);
+
+        let body_area: Element<'a, Message> = if state.loading && state.messages.is_empty() {
+            widget::container(
+                widget::text::body("Loading conversation…")
+                    .class(cosmic::theme::Text::Custom(muted_text_style)),
+            )
+            .center(Length::Fill)
+            .into()
+        } else if state.messages.is_empty() {
+            widget::container(
+                widget::text::body("No messages in this conversation.")
+                    .class(cosmic::theme::Text::Custom(muted_text_style)),
+            )
+            .center(Length::Fill)
+            .into()
+        } else {
+            widget::scrollable(self.view_message_cards(
+                &state.messages,
+                &state.body_editors,
+                Some(win_id),
+            ))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+        };
+
+        widget::container(
+            widget::column::with_capacity(5)
+                .push(header)
+                .push(widget::divider::horizontal::default())
+                .push(toolbar)
+                .push(widget::divider::horizontal::default())
+                .push(body_area)
+                .width(Length::Fill)
+                .height(Length::Fill),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .class(cosmic::theme::Container::Background)
+        .into()
+    }
+
+    fn view_message_cards<'a>(
+        &'a self,
+        messages: &'a [MailMessage],
+        body_editors: &'a HashMap<MessageId, widget::text_editor::Content>,
+        window_id: Option<window::Id>,
+    ) -> Element<'a, Message> {
+        let thread_subject = messages
             .first()
             .map(|m| m.subject.as_str())
             .filter(|s| !s.trim().is_empty())
             .unwrap_or("(No subject)");
 
-        let mut col = widget::column::with_capacity(self.inbox.conversation.len() + 1)
+        let mut col = widget::column::with_capacity(messages.len() + 1)
             .spacing(14)
             .padding(20)
             .max_width(840.0)
             .push(widget::text::title3(thread_subject));
 
-        for (msg_idx, msg) in self.inbox.conversation.iter().enumerate() {
+        for (msg_idx, msg) in messages.iter().enumerate() {
             let primary_sender = msg.from.first();
             let sender_name = primary_sender
                 .map(|a| a.display_name())
@@ -2762,13 +3257,21 @@ impl App {
                 .align_y(Alignment::Start);
 
             let msg_menu = vec![
-                menu::Item::Button("Copy message text", None, CopyMessageField::Body(msg_idx)),
+                menu::Item::Button(
+                    "Copy message text",
+                    None,
+                    CopyMessageField::Body(window_id, msg_idx),
+                ),
                 menu::Item::Button(
                     "Copy sender address",
                     None,
-                    CopyMessageField::Sender(msg_idx),
+                    CopyMessageField::Sender(window_id, msg_idx),
                 ),
-                menu::Item::Button("Copy subject", None, CopyMessageField::Subject(msg_idx)),
+                menu::Item::Button(
+                    "Copy subject",
+                    None,
+                    CopyMessageField::Subject(window_id, msg_idx),
+                ),
             ];
 
             let mut card = widget::column::with_capacity(8)
@@ -2810,7 +3313,7 @@ impl App {
                 );
             }
 
-            if let Some(editor_content) = self.body_editors.get(&msg.id) {
+            if let Some(editor_content) = body_editors.get(&msg.id) {
                 let msg_id = msg.id.clone();
                 card = card.push(
                     widget::text_editor::text_editor(editor_content)
@@ -2818,7 +3321,12 @@ impl App {
                         .size(14.0)
                         .wrapping(cosmic::iced::widget::text::Wrapping::WordOrGlyph)
                         .style(readonly_body_editor_style)
-                        .on_action(move |action| Message::BodyEditorAction(msg_id.clone(), action)),
+                        .on_action(move |action| match window_id {
+                            Some(win_id) => {
+                                Message::ThreadWindowBodyAction(win_id, msg_id.clone(), action)
+                            }
+                            None => Message::BodyEditorAction(msg_id.clone(), action),
+                        }),
                 );
             } else {
                 let body = if prepared.main_text.is_empty() {
@@ -2912,18 +3420,27 @@ impl App {
             col = col.push(card_box);
         }
 
-        widget::column::with_capacity(3)
-            .push(toolbar)
-            .push(widget::divider::horizontal::default())
-            .push(
-                widget::scrollable(col)
-                    .width(Length::Fill)
-                    .height(Length::Fill),
-            )
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into()
+        col.into()
     }
+}
+
+fn build_body_editors(
+    messages: &[MailMessage],
+) -> HashMap<MessageId, widget::text_editor::Content> {
+    let mut map = HashMap::with_capacity(messages.len());
+    for msg in messages {
+        let prepared = html::prepare_body(msg.text_body.as_deref(), msg.html_body.as_deref());
+        let body = if prepared.main_text.is_empty() {
+            "(Empty message body)".to_string()
+        } else {
+            prepared.main_text
+        };
+        map.insert(
+            msg.id.clone(),
+            widget::text_editor::Content::with_text(&body),
+        );
+    }
+    map
 }
 
 fn persist_sync_states(cache: &VelaCache, states: &SyncStates) {
