@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.rlyeh.vela.Cosmic</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <name>Vela</name>
+  <summary>Lightweight native JMAP email client for COSMIC</summary>
+  <developer id="com.rlyeh">
+    <name>constXife</name>
+  </developer>
+  <description>
+    <p>
+      Vela is a calm, native three-pane email client built in Rust with libcosmic
+      and JMAP (RFC 8620 / 8621), targeting Stalwart and Fastmail.
+    </p>
+    <ul>
+      <li>Three-pane COSMIC UI with collapsible sidebar, resizable panes, and keyboard triage</li>
+      <li>Standalone Settings window and pop-out conversation windows with triage toolbars</li>
+      <li>Multi-account JMAP support with OS Keyring (Secret Service) credential storage</li>
+      <li>Encrypted SQLCipher (AES-256) local cache with FTS5 full-text search and incremental sync</li>
+      <li>Selectable read-only message bodies, privacy-first remote image blocking, and attachment downloads</li>
+      <li>Built-in headless MCP server (vela-mcp) with read-only and triage modes</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">com.rlyeh.vela.Cosmic.desktop</launchable>
+  <icon type="stock">com.rlyeh.vela.Cosmic</icon>
+  <categories>
+    <category>Network</category>
+    <category>Email</category>
+  </categories>
+  <keywords>
+    <keyword>Mail</keyword>
+    <keyword>Email</keyword>
+    <keyword>JMAP</keyword>
+    <keyword>COSMIC</keyword>
+    <keyword>Stalwart</keyword>
+    <keyword>Fastmail</keyword>
+  </keywords>
+  <url type="homepage">https://github.com/constXife/vela</url>
+  <url type="bugtracker">https://github.com/constXife/vela/issues</url>
+  <url type="vcs-browser">https://github.com/constXife/vela</url>
+  <provides>
+    <binary>vela-cosmic</binary>
+    <binary>vela-mcp</binary>
+  </provides>
+  <requires>
+    <display_length compare="ge">768</display_length>
+  </requires>
+  <recommends>
+    <control>keyboard</control>
+    <control>pointing</control>
+  </recommends>
+  <content_rating type="oars-1.1" />
+  <releases>
+    <release version="0.1.0" date="2026-11-26">
+      <description>
+        <p>Initial COSMIC JMAP client prototype with multi-account support, encrypted SQLCipher cache, selectable message bodies, pop-out thread windows, and vela-mcp.</p>
+      </description>
+    </release>
+  </releases>
+</component>

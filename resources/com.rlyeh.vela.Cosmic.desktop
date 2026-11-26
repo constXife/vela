@@ -1,0 +1,12 @@
+[Desktop Entry]
+Name=Vela
+GenericName=Email Client
+Comment=Lightweight native JMAP email client for the COSMIC desktop
+Type=Application
+Exec=vela-cosmic
+Icon=com.rlyeh.vela.Cosmic
+Terminal=false
+Categories=Network;Email;COSMIC;
+Keywords=Mail;Email;JMAP;Stalwart;Fastmail;Inbox;
+StartupNotify=true
+StartupWMClass=com.rlyeh.vela.Cosmic
