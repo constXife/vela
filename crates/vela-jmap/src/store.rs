@@ -71,13 +71,20 @@ impl AccountsConfig {
     }
 
     pub fn upsert(&mut self, mut account: AccountConfig) -> AccountConfig {
-        account.ensure_id();
         if let Some(existing) = self.accounts.iter_mut().find(|a| {
-            a.id == account.id
-                || (a.server_url == account.server_url && a.username == account.username)
+            (!account.id.is_empty() && a.id == account.id)
+                || (account.auth_kind == AuthKind::Basic
+                    && a.auth_kind == AuthKind::Basic
+                    && a.server_url == account.server_url
+                    && a.username == account.username)
         }) {
+            account.id = existing.id.clone();
             *existing = account.clone();
         } else {
+            if account.id.trim().is_empty() {
+                account.id = generate_account_id(&account.server_url, &account.username)
+                    .unwrap_or_else(|_| account_id_for(&account.server_url, &account.username));
+            }
             self.accounts.push(account.clone());
         }
         self.active_account_id = Some(account.id.clone());
@@ -91,6 +98,23 @@ pub enum AuthKind {
     #[default]
     Basic,
     Bearer,
+}
+
+/// Generate a collision-resistant, filesystem-safe identifier for a new account.
+pub fn generate_account_id(server_url: &str, username: &str) -> Result<String, VelaError> {
+    let prefix = account_id_for(server_url, username);
+    let mut raw = [0u8; 8];
+    let mut urandom = fs::File::open("/dev/urandom")
+        .map_err(|err| VelaError::Other(format!("failed to open /dev/urandom: {err}")))?;
+    urandom
+        .read_exact(&mut raw)
+        .map_err(|err| VelaError::Other(format!("failed to read random account id: {err}")))?;
+    let mut suffix = String::with_capacity(16);
+    for byte in raw {
+        use std::fmt::Write;
+        let _ = write!(&mut suffix, "{byte:02x}");
+    }
+    Ok(format!("{prefix}_{suffix}"))
 }
 
 /// Deterministic, filesystem-safe identifier for a `(server_url, username)` pair.
@@ -217,11 +241,22 @@ pub fn set_active_account(account_id: &str) -> Result<(), VelaError> {
     Ok(())
 }
 
-fn keyring_attributes<'a>(server_url: &'a str, username: &'a str) -> HashMap<&'a str, &'a str> {
+fn keyring_attributes_legacy<'a>(
+    server_url: &'a str,
+    username: &'a str,
+) -> HashMap<&'a str, &'a str> {
     HashMap::from([
         ("application", KEYRING_APP_ID),
         ("server", server_url),
         ("username", username),
+    ])
+}
+
+fn keyring_attributes_for_id(account_id: &str) -> HashMap<&'static str, String> {
+    HashMap::from([
+        ("application", KEYRING_APP_ID.to_string()),
+        ("kind", "jmap_secret".to_string()),
+        ("account_id", account_id.to_string()),
     ])
 }
 
@@ -248,11 +283,18 @@ async fn load_jmap_config_for_account(
     let keyring = oo7::Keyring::new()
         .await
         .map_err(|err| VelaError::Auth(format!("OS keyring unavailable: {err}")))?;
-    let attrs = keyring_attributes(&account.server_url, &account.username);
-    let items = keyring
-        .search_items(&attrs)
+    let id_attrs = keyring_attributes_for_id(&account.id);
+    let mut items = keyring
+        .search_items(&id_attrs)
         .await
         .map_err(|err| VelaError::Auth(format!("keyring lookup failed: {err}")))?;
+    if items.is_empty() {
+        let legacy_attrs = keyring_attributes_legacy(&account.server_url, &account.username);
+        items = keyring
+            .search_items(&legacy_attrs)
+            .await
+            .map_err(|err| VelaError::Auth(format!("keyring lookup failed: {err}")))?;
+    }
 
     let Some(item) = items.into_iter().next() else {
         return Ok(None);
@@ -288,18 +330,36 @@ pub async fn save_jmap_config(config: &JmapConfig) -> Result<AccountConfig, Vela
         JmapCredentials::Bearer { token } => ("bearer", token.as_str(), AuthKind::Bearer),
     };
 
+    let mut accounts_cfg = load_accounts_config().unwrap_or_default();
+    let target_id = if auth_kind == AuthKind::Basic {
+        accounts_cfg
+            .accounts
+            .iter()
+            .find(|a| {
+                a.auth_kind == AuthKind::Basic
+                    && a.server_url == config.server_url
+                    && a.username == username
+            })
+            .map(|a| a.id.clone())
+    } else {
+        None
+    };
+    let account_id = match target_id {
+        Some(existing_id) => existing_id,
+        None => generate_account_id(&config.server_url, username)?,
+    };
+
     let keyring = oo7::Keyring::new()
         .await
         .map_err(|err| VelaError::Auth(format!("OS keyring unavailable: {err}")))?;
-    let attrs = keyring_attributes(&config.server_url, username);
+    let attrs = keyring_attributes_for_id(&account_id);
     keyring
         .create_item(KEYRING_LABEL, &attrs, secret.as_bytes(), true)
         .await
         .map_err(|err| VelaError::Auth(format!("failed to save secret to OS keyring: {err}")))?;
 
-    let mut accounts_cfg = load_accounts_config().unwrap_or_default();
     let saved = accounts_cfg.upsert(AccountConfig {
-        id: account_id_for(&config.server_url, username),
+        id: account_id,
         server_url: config.server_url.clone(),
         username: username.to_string(),
         auth_kind,
@@ -313,12 +373,28 @@ pub async fn save_jmap_config(config: &JmapConfig) -> Result<AccountConfig, Vela
 pub async fn remove_account(account_id: &str) -> Result<Option<String>, VelaError> {
     let mut cfg = load_accounts_config()?;
     if let Some(pos) = cfg.accounts.iter().position(|a| a.id == account_id) {
-        let removed = cfg.accounts.remove(pos);
-        if let Ok(keyring) = oo7::Keyring::new().await {
-            let attrs = keyring_attributes(&removed.server_url, &removed.username);
-            let _ = keyring.delete(&attrs).await;
+        let removed = cfg.accounts[pos].clone();
+        let keyring = oo7::Keyring::new()
+            .await
+            .map_err(|err| VelaError::Auth(format!("OS keyring unavailable: {err}")))?;
+        let id_attrs = keyring_attributes_for_id(&removed.id);
+        keyring
+            .delete(&id_attrs)
+            .await
+            .map_err(|err| VelaError::Auth(format!("failed to delete keyring secret: {err}")))?;
+
+        let has_other_same_pair = cfg.accounts.iter().enumerate().any(|(idx, a)| {
+            idx != pos && a.server_url == removed.server_url && a.username == removed.username
+        });
+        if !has_other_same_pair {
+            let legacy_attrs = keyring_attributes_legacy(&removed.server_url, &removed.username);
+            keyring.delete(&legacy_attrs).await.map_err(|err| {
+                VelaError::Auth(format!("failed to delete legacy keyring secret: {err}"))
+            })?;
         }
-        let _ = clear_cache_key_for(&removed.id).await;
+
+        clear_cache_key_for(&removed.id).await?;
+        cfg.accounts.remove(pos);
     }
     let next_active = cfg.accounts.first().map(|a| a.id.clone());
     cfg.active_account_id = next_active.clone();
@@ -334,11 +410,16 @@ pub async fn clear_saved_secret() -> Result<(), VelaError> {
     let keyring = oo7::Keyring::new()
         .await
         .map_err(|err| VelaError::Auth(format!("OS keyring unavailable: {err}")))?;
-    let attrs = keyring_attributes(&account.server_url, &account.username);
+    let id_attrs = keyring_attributes_for_id(&account.id);
     keyring
-        .delete(&attrs)
+        .delete(&id_attrs)
         .await
         .map_err(|err| VelaError::Auth(format!("failed to clear keyring secret: {err}")))?;
+    let legacy_attrs = keyring_attributes_legacy(&account.server_url, &account.username);
+    keyring
+        .delete(&legacy_attrs)
+        .await
+        .map_err(|err| VelaError::Auth(format!("failed to clear legacy keyring secret: {err}")))?;
     Ok(())
 }
 
@@ -464,5 +545,49 @@ auth_kind = "basic"
         let reparsed = parse_accounts_config(&serialized).unwrap();
         assert_eq!(reparsed.accounts.len(), 2);
         assert_eq!(reparsed.find(&a1.id).unwrap().host(), "mail.example.com");
+    }
+
+    #[test]
+    fn multiple_bearer_and_similar_basic_accounts_get_distinct_ids() {
+        let mut cfg = AccountsConfig::default();
+        let b1 = cfg.upsert(AccountConfig {
+            id: String::new(),
+            server_url: "https://api.fastmail.com".into(),
+            username: "bearer".into(),
+            auth_kind: AuthKind::Bearer,
+        });
+        let b2 = cfg.upsert(AccountConfig {
+            id: String::new(),
+            server_url: "https://api.fastmail.com".into(),
+            username: "bearer".into(),
+            auth_kind: AuthKind::Bearer,
+        });
+        assert_ne!(b1.id, b2.id);
+        assert_eq!(cfg.accounts.len(), 2);
+
+        let u1 = cfg.upsert(AccountConfig {
+            id: String::new(),
+            server_url: "https://mail.example.com".into(),
+            username: "alice.smith".into(),
+            auth_kind: AuthKind::Basic,
+        });
+        let u2 = cfg.upsert(AccountConfig {
+            id: String::new(),
+            server_url: "https://mail.example.com".into(),
+            username: "alice_smith".into(),
+            auth_kind: AuthKind::Basic,
+        });
+        assert_ne!(u1.id, u2.id);
+        assert_eq!(cfg.accounts.len(), 4);
+
+        // Re-upserting the same Basic account preserves its existing ID.
+        let u1_updated = cfg.upsert(AccountConfig {
+            id: String::new(),
+            server_url: "https://mail.example.com".into(),
+            username: "alice.smith".into(),
+            auth_kind: AuthKind::Basic,
+        });
+        assert_eq!(u1_updated.id, u1.id);
+        assert_eq!(cfg.accounts.len(), 4);
     }
 }

@@ -119,6 +119,9 @@ pub struct ChangesCheck {
 /// Live JMAP session handle wrapping `jmap-client`.
 pub struct JmapSession {
     client: jmap_client::client::Client,
+    http: reqwest::Client,
+    server_url: String,
+    credentials: JmapCredentials,
 }
 
 impl fmt::Debug for JmapSession {
@@ -147,8 +150,33 @@ impl JmapSession {
             .await
             .map_err(|err| VelaError::Transport(err.to_string()))?;
 
+        validate_session_endpoints(&config.server_url, &client.session())?;
+
+        let server_url_for_redirect = config.server_url.clone();
+        let http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::custom(move |attempt| {
+                if attempt.previous().len() >= 5 {
+                    return attempt.error("too many redirects");
+                }
+                match validate_session_url(
+                    &server_url_for_redirect,
+                    "redirect",
+                    attempt.url().as_str(),
+                ) {
+                    Ok(()) => attempt.follow(),
+                    Err(err) => attempt.error(err.to_string()),
+                }
+            }))
+            .build()
+            .map_err(|err| VelaError::Transport(err.to_string()))?;
+
         tracing::info!(server = %config.server_url, "connected to JMAP server");
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            http,
+            server_url: config.server_url.clone(),
+            credentials: config.credentials.clone(),
+        })
     }
 
     /// Access the underlying `jmap-client` instance for advanced calls.
@@ -634,17 +662,60 @@ impl JmapSession {
         blob_id: &BlobId,
         limit: usize,
     ) -> Result<Vec<u8>, VelaError> {
-        let bytes = self
-            .client
-            .download(&blob_id.0)
+        let session = self.client.session();
+        let account_id = self.client.default_account_id();
+        let url = session
+            .download_url()
+            .replace("{accountId}", account_id)
+            .replace("{blobId}", &blob_id.0)
+            .replace("{type}", "application%2Foctet-stream")
+            .replace("{name}", "blob");
+        validate_session_url(&self.server_url, "downloadUrl", &url)?;
+
+        let req = self.http.get(&url);
+        let req = match &self.credentials {
+            JmapCredentials::Basic { username, password } => {
+                req.basic_auth(username, Some(password))
+            }
+            JmapCredentials::Bearer { token } => req.bearer_auth(token),
+        };
+
+        let mut resp = req
+            .send()
             .await
             .map_err(|err| VelaError::Transport(err.to_string()))?;
-        if bytes.len() > limit {
-            return Err(VelaError::Other(format!(
-                "blob {} exceeds download limit ({} bytes)",
-                blob_id.0,
-                bytes.len()
+        if !resp.status().is_success() {
+            return Err(VelaError::Transport(format!(
+                "blob download failed with HTTP {}",
+                resp.status()
             )));
+        }
+        if let Some(content_len) = resp.content_length()
+            && content_len > limit as u64
+        {
+            return Err(VelaError::Other(format!(
+                "blob {} exceeds download limit ({content_len} bytes)",
+                blob_id.0
+            )));
+        }
+
+        let mut bytes = Vec::with_capacity(
+            resp.content_length()
+                .map(|n| (n as usize).min(limit))
+                .unwrap_or(0),
+        );
+        while let Some(chunk) = resp
+            .chunk()
+            .await
+            .map_err(|err| VelaError::Transport(err.to_string()))?
+        {
+            if bytes.len().saturating_add(chunk.len()) > limit {
+                return Err(VelaError::Other(format!(
+                    "blob {} exceeds download limit ({limit} bytes)",
+                    blob_id.0
+                )));
+            }
+            bytes.extend_from_slice(&chunk);
         }
         Ok(bytes)
     }
@@ -703,20 +774,22 @@ fn join_body_parts(
     }
 }
 
-fn extract_host(url: &str) -> Option<String> {
-    let without_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
-    let authority = without_scheme.split('/').next()?;
-    let host_port = authority.rsplit('@').next()?;
-    let host = if host_port.starts_with('[') {
-        host_port.split(']').next()?.trim_start_matches('[')
-    } else {
-        host_port.split(':').next()?
-    };
-    if host.is_empty() {
-        None
-    } else {
-        Some(host.to_string())
+fn is_loopback_host(host: &str) -> bool {
+    let unbracketed = host
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(host);
+    if unbracketed.eq_ignore_ascii_case("localhost") {
+        return true;
     }
+    unbracketed
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback())
+}
+
+fn extract_host(url: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(url.trim()).ok()?;
+    parsed.host_str().map(str::to_string)
 }
 
 fn quick_has_remote_images(html: &str) -> bool {
@@ -732,31 +805,77 @@ fn quick_has_remote_images(html: &str) -> bool {
 /// Require `https://` for remote JMAP servers so credentials are never sent in
 /// cleartext; allow `http://` only for loopback hosts during local testing.
 pub fn validate_server_url(url: &str) -> Result<(), VelaError> {
-    let trimmed = url.trim();
-    if trimmed.starts_with("https://") {
-        let host = extract_host(trimmed).unwrap_or_default();
-        if host.is_empty() {
-            return Err(VelaError::Auth("Server URL is missing a host".into()));
-        }
-        return Ok(());
-    }
-    if trimmed.starts_with("http://") {
-        let host = extract_host(trimmed).unwrap_or_default();
-        if matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1" | "[::1]") {
-            return Ok(());
-        }
-        return Err(VelaError::Auth(
+    let parsed = reqwest::Url::parse(url.trim())
+        .map_err(|err| VelaError::Auth(format!("Invalid JMAP server URL: {err}")))?;
+    let host = parsed
+        .host_str()
+        .filter(|h| !h.is_empty())
+        .ok_or_else(|| VelaError::Auth("Server URL is missing a host".into()))?;
+
+    match parsed.scheme() {
+        "https" => Ok(()),
+        "http" if is_loopback_host(host) => Ok(()),
+        "http" => Err(VelaError::Auth(
             "Refusing insecure http:// JMAP server URL; use https:// (http:// is only allowed for localhost)".into(),
-        ));
+        )),
+        _ => Err(VelaError::Auth(
+            "JMAP server URL must start with https://".into(),
+        )),
     }
-    Err(VelaError::Auth(
-        "JMAP server URL must start with https://".into(),
-    ))
+}
+
+/// Validate that JMAP session endpoints (`apiUrl`, `downloadUrl`, `uploadUrl`)
+/// do not downgrade an HTTPS connection to cleartext HTTP (RFC 8620 §1.7).
+pub fn validate_session_url(
+    server_url: &str,
+    endpoint_name: &str,
+    endpoint_url: &str,
+) -> Result<(), VelaError> {
+    let server = reqwest::Url::parse(server_url.trim())
+        .map_err(|err| VelaError::Auth(format!("Invalid JMAP server URL: {err}")))?;
+    let endpoint = reqwest::Url::parse(endpoint_url.trim()).map_err(|err| {
+        VelaError::Auth(format!(
+            "JMAP session returned invalid {endpoint_name} URL: {err}"
+        ))
+    })?;
+    let host = endpoint
+        .host_str()
+        .filter(|h| !h.is_empty())
+        .ok_or_else(|| {
+            VelaError::Auth(format!(
+                "JMAP session {endpoint_name} URL is missing a host"
+            ))
+        })?;
+
+    match endpoint.scheme() {
+        "https" => Ok(()),
+        "http" if server.scheme() == "http" && is_loopback_host(host) => Ok(()),
+        "http" => Err(VelaError::Auth(format!(
+            "Refusing insecure http:// JMAP {endpoint_name} URL from session discovery"
+        ))),
+        scheme => Err(VelaError::Auth(format!(
+            "Refusing unsupported scheme '{scheme}' in JMAP {endpoint_name} URL"
+        ))),
+    }
+}
+
+fn validate_session_endpoints(
+    server_url: &str,
+    session: &jmap_client::core::session::Session,
+) -> Result<(), VelaError> {
+    validate_session_url(server_url, "apiUrl", session.api_url())?;
+    if !session.download_url().trim().is_empty() {
+        validate_session_url(server_url, "downloadUrl", session.download_url())?;
+    }
+    if !session.upload_url().trim().is_empty() {
+        validate_session_url(server_url, "uploadUrl", session.upload_url())?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::validate_server_url;
+    use super::{extract_host, validate_server_url, validate_session_url};
 
     #[test]
     fn validates_jmap_server_url_scheme() {
@@ -764,8 +883,72 @@ mod tests {
         assert!(validate_server_url("https://api.fastmail.com/jmap/session").is_ok());
         assert!(validate_server_url("http://localhost:8080").is_ok());
         assert!(validate_server_url("http://127.0.0.1:8080").is_ok());
+        assert!(validate_server_url("http://[::1]:8080").is_ok());
         assert!(validate_server_url("http://mail.example.com").is_err());
         assert!(validate_server_url("ftp://mail.example.com").is_err());
         assert!(validate_server_url("https://").is_err());
+    }
+
+    #[test]
+    fn rejects_url_parser_bypass_tricks() {
+        assert!(validate_server_url("http://evil.example?@localhost").is_err());
+        assert!(validate_server_url("http://evil.example#@127.0.0.1").is_err());
+        assert!(validate_server_url(r"http://evil.example\@localhost").is_err());
+        assert_eq!(
+            extract_host("http://evil.example?@localhost").as_deref(),
+            Some("evil.example")
+        );
+    }
+
+    #[test]
+    fn validates_session_endpoint_urls_against_downgrade() {
+        assert!(
+            validate_session_url(
+                "https://mail.example.com",
+                "apiUrl",
+                "https://api.example.com/jmap/"
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_session_url(
+                "https://mail.example.com",
+                "downloadUrl",
+                "https://api.example.com/jmap/download/{accountId}/{blobId}/{name}?type={type}"
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_session_url(
+                "https://mail.example.com",
+                "apiUrl",
+                "http://mail.example.com/jmap/"
+            )
+            .is_err()
+        );
+        assert!(
+            validate_session_url(
+                "https://mail.example.com",
+                "apiUrl",
+                "http://localhost:8080/jmap/"
+            )
+            .is_err()
+        );
+        assert!(
+            validate_session_url(
+                "http://localhost:8080",
+                "apiUrl",
+                "http://127.0.0.1:8080/jmap/"
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_session_url(
+                "http://localhost:8080",
+                "apiUrl",
+                "http://evil.example/jmap/"
+            )
+            .is_err()
+        );
     }
 }

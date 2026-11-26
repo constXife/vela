@@ -141,6 +141,7 @@ enum ThreadWindowAction {
 }
 
 struct ThreadWindowState {
+    session_gen: u64,
     thread_id: ThreadId,
     subject: String,
     unread: bool,
@@ -229,6 +230,7 @@ struct App {
     inbox: InboxState,
     session: Option<Arc<JmapSession>>,
     cache: Option<Arc<VelaCache>>,
+    session_gen: u64,
     accounts: Vec<store::AccountConfig>,
     active_account_id: Option<String>,
     syncing: bool,
@@ -284,9 +286,10 @@ enum Message {
     SwitchAccount(String),
     RemoveAccount(String),
     SignOut,
-    SignedOut(Option<String>),
+    SignedOut(Result<Option<String>, String>),
     SelectMailbox(MailboxId),
     ThreadsLoaded {
+        session_gen: u64,
         op_id: vela_flows::OpId,
         mailbox_id: MailboxId,
         result: Result<(Vec<ThreadSummary>, SyncStates), String>,
@@ -295,11 +298,13 @@ enum Message {
     SelectNext,
     SelectPrev,
     ConversationLoaded {
+        session_gen: u64,
         op_id: vela_flows::OpId,
         thread_id: ThreadId,
         result: Result<Vec<MailMessage>, String>,
     },
     ConversationPrefetched {
+        session_gen: u64,
         thread_id: ThreadId,
         result: Result<Vec<MailMessage>, String>,
     },
@@ -317,8 +322,14 @@ enum Message {
     SetFilter(ThreadFilter),
     ClearFilters,
     SyncNow,
-    SyncChangesChecked(Result<ChangesCheck, String>),
-    SyncMailboxesFinished(Result<(Vec<Mailbox>, String), String>),
+    SyncChangesChecked {
+        session_gen: u64,
+        result: Result<ChangesCheck, String>,
+    },
+    SyncMailboxesFinished {
+        session_gen: u64,
+        result: Result<(Vec<Mailbox>, String), String>,
+    },
     DownloadAttachment(Attachment),
     AttachmentDownloaded {
         blob_id: BlobId,
@@ -353,6 +364,7 @@ enum Message {
     BodyEditorAction(MessageId, widget::text_editor::Action),
     ThreadWindowOpened,
     ThreadWindowLoaded {
+        session_gen: u64,
         window_id: window::Id,
         result: Result<Vec<MailMessage>, String>,
     },
@@ -365,6 +377,11 @@ enum Message {
 }
 
 impl App {
+    fn bump_session_gen(&mut self) -> u64 {
+        self.session_gen = self.session_gen.wrapping_add(1);
+        self.session_gen
+    }
+
     fn refresh_accounts_from_disk(&mut self) {
         if let Ok(cfg) = store::load_accounts_config() {
             self.accounts = cfg.accounts;
@@ -467,9 +484,11 @@ impl App {
             ..Default::default()
         });
 
+        let session_gen = self.session_gen;
         self.thread_windows.insert(
             win_id,
             ThreadWindowState {
+                session_gen,
                 thread_id: thread_id.clone(),
                 subject,
                 unread,
@@ -490,6 +509,7 @@ impl App {
                     .await
                     .map_err(|e| e.to_string());
                 Message::ThreadWindowLoaded {
+                    session_gen,
                     window_id: win_id,
                     result,
                 }
@@ -564,12 +584,14 @@ impl App {
 
                 if let Some(session) = self.session.clone() {
                     let mb = mailbox_id.clone();
+                    let session_gen = self.session_gen;
                     cosmic::task::future(async move {
                         let result = session
                             .list_threads_with_state(&mb, INITIAL_THREAD_LIMIT)
                             .await
                             .map_err(|e| e.to_string());
                         Message::ThreadsLoaded {
+                            session_gen,
                             op_id,
                             mailbox_id: mb,
                             result,
@@ -599,12 +621,14 @@ impl App {
 
                 if let Some(session) = self.session.clone() {
                     let tid = thread_id.clone();
+                    let session_gen = self.session_gen;
                     cosmic::task::future(async move {
                         let result = session
                             .load_conversation(&tid)
                             .await
                             .map_err(|e| e.to_string());
                         Message::ConversationLoaded {
+                            session_gen,
                             op_id,
                             thread_id: tid,
                             result,
@@ -635,12 +659,14 @@ impl App {
                     return Task::none();
                 };
                 let tid = thread_id.clone();
+                let session_gen = self.session_gen;
                 cosmic::task::future(async move {
                     let result = session
                         .load_conversation(&tid)
                         .await
                         .map_err(|e| e.to_string());
                     Message::ConversationPrefetched {
+                        session_gen,
                         thread_id: tid,
                         result,
                     }
@@ -746,6 +772,7 @@ impl cosmic::Application for App {
             inbox: InboxState::new(),
             session: None,
             cache: None,
+            session_gen: 1,
             accounts: accounts_cfg.accounts,
             active_account_id: active_id.clone(),
             syncing: !flags.sample_mode && active_id.is_some(),
@@ -901,6 +928,7 @@ impl cosmic::Application for App {
                 if self.active_account_id.as_deref() != Some(account_id.as_str()) {
                     return Task::none();
                 }
+                self.bump_session_gen();
                 self.sync_states.mailbox_state = Some(mb_state);
                 if let Some(cache) = self.cache.clone() {
                     let mbs = mailboxes.clone();
@@ -1022,6 +1050,8 @@ impl cosmic::Application for App {
                 self.add_account_form.wipe_password();
                 self.add_account_form = ConnectForm::fresh_empty();
                 self.editing_account_id = None;
+                self.bump_session_gen();
+                let close_windows = self.close_all_thread_windows();
                 self.refresh_accounts_from_disk();
                 self.active_account_id = Some(account_id.clone());
                 self.sync_states = SyncStates {
@@ -1033,6 +1063,7 @@ impl cosmic::Application for App {
                 self.cache = None;
                 self.syncing = false;
                 self.inbox = InboxState::new();
+                self.body_editors.clear();
                 self.screen = Screen::Inbox;
                 let aid = account_id.clone();
                 let open_cache_task = cosmic::task::future(async move {
@@ -1052,6 +1083,7 @@ impl cosmic::Application for App {
                     }
                 });
                 Task::batch([
+                    close_windows,
                     open_cache_task,
                     self.dispatch(InboxEvent::MailboxesLoaded(mailboxes)),
                 ])
@@ -1066,6 +1098,7 @@ impl cosmic::Application for App {
                 if let Screen::Connect(form) = &mut self.screen {
                     form.wipe_password();
                 }
+                self.bump_session_gen();
                 self.session = None;
                 self.cache = None;
                 self.active_account_id = None;
@@ -1085,6 +1118,7 @@ impl cosmic::Application for App {
             Message::RemoveAccount(account_id) => {
                 let was_active = self.active_account_id.as_deref() == Some(account_id.as_str());
                 let close_windows = if was_active {
+                    self.bump_session_gen();
                     self.active_account_id = None;
                     self.session = None;
                     self.cache = None;
@@ -1097,12 +1131,17 @@ impl cosmic::Application for App {
                     Task::none()
                 };
                 let remove_task = cosmic::task::future(async move {
-                    let next = store::remove_account(&account_id).await.ok().flatten();
-                    let _ = tokio::task::spawn_blocking(move || {
-                        vela_cache::destroy_account_cache(&account_id)
-                    })
-                    .await;
-                    Message::SignedOut(if was_active { next } else { None })
+                    let result = match store::remove_account(&account_id).await {
+                        Ok(next) => {
+                            let _ = tokio::task::spawn_blocking(move || {
+                                vela_cache::destroy_account_cache(&account_id)
+                            })
+                            .await;
+                            Ok(if was_active { next } else { None })
+                        }
+                        Err(err) => Err(format!("Failed to remove account credentials: {err}")),
+                    };
+                    Message::SignedOut(result)
                 });
                 Task::batch([close_windows, remove_task])
             }
@@ -1112,6 +1151,7 @@ impl cosmic::Application for App {
                 {
                     return Task::none();
                 }
+                self.bump_session_gen();
                 let _ = store::set_active_account(&account_id);
                 self.active_account_id = Some(account_id.clone());
                 self.session = None;
@@ -1125,6 +1165,7 @@ impl cosmic::Application for App {
                 Task::batch([close_windows, spawn_account_load_tasks(account_id)])
             }
             Message::SignOut => {
+                self.bump_session_gen();
                 let removing = self.active_account_id.take();
                 self.session = None;
                 self.cache = None;
@@ -1134,70 +1175,97 @@ impl cosmic::Application for App {
                 self.body_editors.clear();
                 let close_windows = self.close_all_thread_windows();
                 let signout_task = cosmic::task::future(async move {
-                    let next_active = if let Some(account_id) = removing {
-                        let next = store::remove_account(&account_id).await.ok().flatten();
-                        let _ = tokio::task::spawn_blocking(move || {
-                            vela_cache::destroy_account_cache(&account_id)
-                        })
-                        .await;
-                        next
+                    let result = if let Some(account_id) = removing {
+                        match store::remove_account(&account_id).await {
+                            Ok(next) => {
+                                let _ = tokio::task::spawn_blocking(move || {
+                                    vela_cache::destroy_account_cache(&account_id)
+                                })
+                                .await;
+                                Ok(next)
+                            }
+                            Err(err) => Err(format!("Failed to clear keyring secret: {err}")),
+                        }
                     } else {
-                        let _ = store::clear_saved_secret().await;
-                        let _ = store::clear_cache_key().await;
+                        let secret_res = store::clear_saved_secret().await;
+                        let key_res = store::clear_cache_key().await;
                         let _ =
                             tokio::task::spawn_blocking(vela_cache::destroy_default_cache).await;
-                        None
+                        match (secret_res, key_res) {
+                            (Ok(()), Ok(())) => Ok(None),
+                            (Err(e), _) => Err(format!("Failed to clear keyring secret: {e}")),
+                            (_, Err(e)) => Err(format!("Failed to clear cache key: {e}")),
+                        }
                     };
-                    Message::SignedOut(next_active)
+                    Message::SignedOut(result)
                 });
                 Task::batch([close_windows, signout_task])
             }
-            Message::SignedOut(next_account_id) => {
+            Message::SignedOut(result) => {
                 self.refresh_accounts_from_disk();
-                if let Some(next_id) = next_account_id {
-                    self.active_account_id = Some(next_id.clone());
-                    self.syncing = true;
-                    self.screen = Screen::Inbox;
-                    spawn_account_load_tasks(next_id)
-                } else if self.active_account_id.is_some() {
-                    // An inactive account was removed from Settings; keep current session active.
-                    Task::none()
-                } else {
-                    self.active_account_id = None;
-                    self.screen = Screen::Connect(ConnectForm::from_saved_or_default());
-                    Task::none()
+                match result {
+                    Ok(Some(next_id)) => {
+                        self.bump_session_gen();
+                        self.active_account_id = Some(next_id.clone());
+                        self.syncing = true;
+                        self.screen = Screen::Inbox;
+                        spawn_account_load_tasks(next_id)
+                    }
+                    Ok(None) if self.active_account_id.is_some() => {
+                        // An inactive account was removed from Settings; keep current session active.
+                        Task::none()
+                    }
+                    Ok(None) => {
+                        self.active_account_id = None;
+                        self.screen = Screen::Connect(ConnectForm::from_saved_or_default());
+                        Task::none()
+                    }
+                    Err(err) => {
+                        if self.active_account_id.is_none() {
+                            let mut form = ConnectForm::from_saved_or_default();
+                            form.error = Some(err.clone());
+                            self.screen = Screen::Connect(form);
+                        }
+                        self.dispatch(InboxEvent::ReportError(err))
+                    }
                 }
             }
             Message::SelectMailbox(id) => self.dispatch(InboxEvent::SelectMailbox(id)),
             Message::ThreadsLoaded {
+                session_gen,
                 op_id,
                 mailbox_id,
                 result,
-            } => match result {
-                Ok((threads, states)) => {
-                    if let Some(email_state) = states.email_state {
-                        self.sync_states.email_state = Some(email_state);
-                    }
-                    if let Some(thread_state) = states.thread_state {
-                        self.sync_states.thread_state = Some(thread_state);
-                    }
-                    if let Some(cache) = self.cache.clone() {
-                        let mb = mailbox_id.clone();
-                        let ts = threads.clone();
-                        let st = self.sync_states.clone();
-                        tokio::task::spawn_blocking(move || {
-                            let _ = cache.save_threads(&mb, &ts);
-                            persist_sync_states(&cache, &st);
-                        });
-                    }
-                    self.dispatch(InboxEvent::ThreadsLoaded {
-                        op_id,
-                        mailbox_id,
-                        threads,
-                    })
+            } => {
+                if session_gen != self.session_gen {
+                    return Task::none();
                 }
-                Err(err) => self.dispatch(InboxEvent::ReportError(err)),
-            },
+                match result {
+                    Ok((threads, states)) => {
+                        if let Some(email_state) = states.email_state {
+                            self.sync_states.email_state = Some(email_state);
+                        }
+                        if let Some(thread_state) = states.thread_state {
+                            self.sync_states.thread_state = Some(thread_state);
+                        }
+                        if let Some(cache) = self.cache.clone() {
+                            let mb = mailbox_id.clone();
+                            let ts = threads.clone();
+                            let st = self.sync_states.clone();
+                            tokio::task::spawn_blocking(move || {
+                                let _ = cache.save_threads(&mb, &ts);
+                                persist_sync_states(&cache, &st);
+                            });
+                        }
+                        self.dispatch(InboxEvent::ThreadsLoaded {
+                            op_id,
+                            mailbox_id,
+                            threads,
+                        })
+                    }
+                    Err(err) => self.dispatch(InboxEvent::ReportError(err)),
+                }
+            }
             Message::SelectThread(id) => {
                 let is_double_click =
                     self.last_thread_click
@@ -1233,56 +1301,77 @@ impl cosmic::Application for App {
                 Task::batch(tasks)
             }
             Message::ConversationLoaded {
+                session_gen,
                 op_id,
                 thread_id,
                 result,
-            } => match result {
-                Ok(messages) => {
-                    if let Some(cache) = self.cache.clone() {
-                        let tid = thread_id.clone();
-                        let msgs = messages.clone();
-                        tokio::task::spawn_blocking(move || {
-                            let _ = cache.save_conversation(&tid, &msgs);
-                        });
-                    }
-                    for state in self.thread_windows.values_mut() {
-                        if state.thread_id == thread_id && state.messages.is_empty() {
-                            state.body_editors = build_body_editors(&messages);
-                            state.messages = messages.clone();
-                            state.loading = false;
-                        }
-                    }
-                    self.dispatch(InboxEvent::ConversationLoaded {
-                        op_id,
-                        thread_id,
-                        messages,
-                    })
+            } => {
+                if session_gen != self.session_gen {
+                    return Task::none();
                 }
-                Err(err) => self.dispatch(InboxEvent::ReportError(err)),
-            },
-            Message::ConversationPrefetched { thread_id, result } => match result {
-                Ok(messages) => {
-                    if let Some(cache) = self.cache.clone() {
-                        let tid = thread_id.clone();
-                        let msgs = messages.clone();
-                        tokio::task::spawn_blocking(move || {
-                            let _ = cache.save_conversation(&tid, &msgs);
-                        });
-                    }
-                    for state in self.thread_windows.values_mut() {
-                        if state.thread_id == thread_id && state.messages.is_empty() {
-                            state.body_editors = build_body_editors(&messages);
-                            state.messages = messages.clone();
-                            state.loading = false;
+                match result {
+                    Ok(messages) => {
+                        if let Some(cache) = self.cache.clone() {
+                            let tid = thread_id.clone();
+                            let msgs = messages.clone();
+                            tokio::task::spawn_blocking(move || {
+                                let _ = cache.save_conversation(&tid, &msgs);
+                            });
                         }
+                        for state in self.thread_windows.values_mut() {
+                            if state.session_gen == session_gen
+                                && state.thread_id == thread_id
+                                && state.messages.is_empty()
+                            {
+                                state.body_editors = build_body_editors(&messages);
+                                state.messages = messages.clone();
+                                state.loading = false;
+                            }
+                        }
+                        self.dispatch(InboxEvent::ConversationLoaded {
+                            op_id,
+                            thread_id,
+                            messages,
+                        })
                     }
-                    self.dispatch(InboxEvent::ConversationPrefetched {
-                        thread_id,
-                        messages,
-                    })
+                    Err(err) => self.dispatch(InboxEvent::ReportError(err)),
                 }
-                Err(_) => self.dispatch(InboxEvent::PrefetchFailed { thread_id }),
-            },
+            }
+            Message::ConversationPrefetched {
+                session_gen,
+                thread_id,
+                result,
+            } => {
+                if session_gen != self.session_gen {
+                    return Task::none();
+                }
+                match result {
+                    Ok(messages) => {
+                        if let Some(cache) = self.cache.clone() {
+                            let tid = thread_id.clone();
+                            let msgs = messages.clone();
+                            tokio::task::spawn_blocking(move || {
+                                let _ = cache.save_conversation(&tid, &msgs);
+                            });
+                        }
+                        for state in self.thread_windows.values_mut() {
+                            if state.session_gen == session_gen
+                                && state.thread_id == thread_id
+                                && state.messages.is_empty()
+                            {
+                                state.body_editors = build_body_editors(&messages);
+                                state.messages = messages.clone();
+                                state.loading = false;
+                            }
+                        }
+                        self.dispatch(InboxEvent::ConversationPrefetched {
+                            thread_id,
+                            messages,
+                        })
+                    }
+                    Err(_) => self.dispatch(InboxEvent::PrefetchFailed { thread_id }),
+                }
+            }
             Message::Archive => self.dispatch(InboxEvent::ArchiveSelected),
             Message::Trash => self.dispatch(InboxEvent::TrashSelected),
             Message::RestoreToInbox => self.dispatch(InboxEvent::MoveSelectedToInbox),
@@ -1316,62 +1405,92 @@ impl cosmic::Application for App {
                 };
                 self.syncing = true;
                 let since = self.sync_states.clone();
+                let session_gen = self.session_gen;
                 cosmic::task::future(async move {
                     let result = session
                         .check_changes(&since)
                         .await
                         .map_err(|e| e.to_string());
-                    Message::SyncChangesChecked(result)
+                    Message::SyncChangesChecked {
+                        session_gen,
+                        result,
+                    }
                 })
             }
-            Message::SyncChangesChecked(Ok(check)) => {
-                if !check.invalidated_threads.is_empty() {
-                    self.inbox
-                        .invalidate_cached_threads(&check.invalidated_threads);
-                    if let Some(cache) = self.cache.clone() {
-                        let invalid = check.invalidated_threads.clone();
-                        tokio::task::spawn_blocking(move || {
-                            let _ = cache.invalidate_threads(&invalid);
-                        });
+            Message::SyncChangesChecked {
+                session_gen,
+                result,
+            } => {
+                if session_gen != self.session_gen {
+                    return Task::none();
+                }
+                match result {
+                    Ok(check) => {
+                        if !check.invalidated_threads.is_empty() {
+                            self.inbox
+                                .invalidate_cached_threads(&check.invalidated_threads);
+                            if let Some(cache) = self.cache.clone() {
+                                let invalid = check.invalidated_threads.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    let _ = cache.invalidate_threads(&invalid);
+                                });
+                            }
+                        }
+                        if !check.mailboxes_changed
+                            && !check.emails_changed
+                            && !check.threads_changed
+                        {
+                            self.syncing = false;
+                            return Task::none();
+                        }
+                        self.sync_states = check.new_states;
+                        let Some(session) = self.session.clone() else {
+                            self.syncing = false;
+                            return Task::none();
+                        };
+                        cosmic::task::future(async move {
+                            let result = session
+                                .list_mailboxes_with_state()
+                                .await
+                                .map_err(|e| e.to_string());
+                            Message::SyncMailboxesFinished {
+                                session_gen,
+                                result,
+                            }
+                        })
+                    }
+                    Err(err) => {
+                        self.syncing = false;
+                        self.dispatch(InboxEvent::ReportError(format!("Sync failed: {err}")))
                     }
                 }
-                if !check.mailboxes_changed && !check.emails_changed && !check.threads_changed {
-                    self.syncing = false;
+            }
+            Message::SyncMailboxesFinished {
+                session_gen,
+                result,
+            } => {
+                if session_gen != self.session_gen {
                     return Task::none();
                 }
-                self.sync_states = check.new_states;
-                let Some(session) = self.session.clone() else {
-                    self.syncing = false;
-                    return Task::none();
-                };
-                cosmic::task::future(async move {
-                    let result = session
-                        .list_mailboxes_with_state()
-                        .await
-                        .map_err(|e| e.to_string());
-                    Message::SyncMailboxesFinished(result)
-                })
-            }
-            Message::SyncChangesChecked(Err(err)) => {
-                self.syncing = false;
-                self.dispatch(InboxEvent::ReportError(format!("Sync failed: {err}")))
-            }
-            Message::SyncMailboxesFinished(Ok((mailboxes, mb_state))) => {
-                self.syncing = false;
-                self.sync_states.mailbox_state = Some(mb_state);
-                if let Some(cache) = self.cache.clone() {
-                    let mbs = mailboxes.clone();
-                    let st = self.sync_states.clone();
-                    tokio::task::spawn_blocking(move || {
-                        let _ = cache.save_mailboxes(&mbs);
-                        persist_sync_states(&cache, &st);
-                    });
+                match result {
+                    Ok((mailboxes, mb_state)) => {
+                        self.syncing = false;
+                        self.sync_states.mailbox_state = Some(mb_state);
+                        if let Some(cache) = self.cache.clone() {
+                            let mbs = mailboxes.clone();
+                            let st = self.sync_states.clone();
+                            tokio::task::spawn_blocking(move || {
+                                let _ = cache.save_mailboxes(&mbs);
+                                persist_sync_states(&cache, &st);
+                            });
+                        }
+                        self.dispatch(InboxEvent::MailboxesLoaded(mailboxes))
+                    }
+                    Err(err) => {
+                        self.syncing = false;
+                        self.dispatch(InboxEvent::ReportError(format!("Sync failed: {err}")))
+                    }
                 }
-                self.dispatch(InboxEvent::MailboxesLoaded(mailboxes))
-            }
-            Message::SyncMailboxesFinished(Err(err)) => {
-                self.syncing = false;
-                self.dispatch(InboxEvent::ReportError(format!("Sync failed: {err}")))
             }
             Message::DownloadAttachment(attachment) => {
                 if attachment.size > vela_jmap::MAX_ATTACHMENT_BYTES as u64 {
@@ -1663,8 +1782,17 @@ impl cosmic::Application for App {
                 Task::none()
             }
             Message::ThreadWindowOpened => Task::none(),
-            Message::ThreadWindowLoaded { window_id, result } => {
-                if let Some(state) = self.thread_windows.get_mut(&window_id) {
+            Message::ThreadWindowLoaded {
+                session_gen,
+                window_id,
+                result,
+            } => {
+                if session_gen != self.session_gen {
+                    return Task::none();
+                }
+                if let Some(state) = self.thread_windows.get_mut(&window_id)
+                    && state.session_gen == session_gen
+                {
                     state.loading = false;
                     match result {
                         Ok(messages) => {
@@ -1710,6 +1838,9 @@ impl cosmic::Application for App {
                 let Some(state) = self.thread_windows.get(&window_id) else {
                     return Task::none();
                 };
+                if state.session_gen != self.session_gen {
+                    return Task::none();
+                }
                 let thread_id = state.thread_id.clone();
                 let in_current_list = self.inbox.threads.iter().any(|t| t.id == thread_id);
 
@@ -3685,28 +3816,39 @@ fn format_file_size(bytes: u64) -> String {
     }
 }
 
+fn is_bidi_control(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+    )
+}
+
+fn sanitize_attachment_filename(raw_name: &str) -> String {
+    let safe_name: String = raw_name
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or("attachment")
+        .chars()
+        .filter(|c| !c.is_control() && !is_bidi_control(*c) && !matches!(c, '/' | '\\' | '\0'))
+        .collect();
+    let trimmed = safe_name.trim_matches('.').trim();
+    if trimmed.is_empty() {
+        "attachment".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 fn save_to_downloads(raw_name: &str, bytes: &[u8]) -> Result<PathBuf, String> {
     let base_dir = dirs::download_dir()
         .or_else(|| dirs::home_dir().map(|h| h.join("Downloads")))
         .ok_or_else(|| "unable to determine Downloads directory".to_string())?;
     std::fs::create_dir_all(&base_dir).map_err(|e| e.to_string())?;
 
-    // Sanitize filename to prevent path traversal from untrusted headers.
-    let safe_name: String = raw_name
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or("attachment")
-        .chars()
-        .filter(|c| !c.is_control() && !matches!(c, '/' | '\\' | '\0'))
-        .collect();
-    let safe_name = safe_name.trim_matches('.');
-    let safe_name = if safe_name.is_empty() {
-        "attachment"
-    } else {
-        safe_name
-    };
+    // Sanitize filename to prevent path traversal and bidi spoofing from untrusted headers.
+    let safe_name = sanitize_attachment_filename(raw_name);
 
-    let candidate = base_dir.join(safe_name);
+    let candidate = base_dir.join(&safe_name);
     let stem = candidate
         .file_stem()
         .and_then(|s| s.to_str())
@@ -3792,5 +3934,23 @@ fn readonly_body_editor_style(
         placeholder: cosmic.on_bg_color().into(),
         value: cosmic.on_bg_color().into(),
         selection,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_attachment_filename;
+
+    #[test]
+    fn sanitizes_attachment_filename_against_traversal_and_bidi() {
+        assert_eq!(
+            sanitize_attachment_filename("../../evil\u{202E}fdp.exe"),
+            "evilfdp.exe"
+        );
+        assert_eq!(sanitize_attachment_filename("..."), "attachment");
+        assert_eq!(
+            sanitize_attachment_filename("report\u{2066}2026\u{2069}.pdf"),
+            "report2026.pdf"
+        );
     }
 }

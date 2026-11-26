@@ -54,7 +54,7 @@ just prefix=~/.local install
 # Read-only mode (default)
 cargo run --release -p vela-mcp
 
-# Triage mode (enables read/flag/archive/trash mutations)
+# Triage mode (enables mark_read/archive/move mutations; Trash and Junk are blocked)
 cargo run --release -p vela-mcp -- --mode triage
 ```
 
