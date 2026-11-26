@@ -358,6 +358,8 @@ enum Message {
     },
     CloseThreadWindow(window::Id),
     DragThreadWindow(window::Id),
+    MaximizeThreadWindow(window::Id),
+    MinimizeThreadWindow(window::Id),
     ThreadWindowBodyAction(window::Id, MessageId, widget::text_editor::Action),
     ThreadWindowTriage(window::Id, ThreadWindowAction),
 }
@@ -1686,6 +1688,8 @@ impl cosmic::Application for App {
                 window::close(window_id)
             }
             Message::DragThreadWindow(window_id) => window::drag(window_id),
+            Message::MaximizeThreadWindow(window_id) => window::toggle_maximize(window_id),
+            Message::MinimizeThreadWindow(window_id) => window::minimize(window_id, true),
             Message::ThreadWindowBodyAction(window_id, msg_id, action) => {
                 if !action.is_edit()
                     && let Some(state) = self.thread_windows.get_mut(&window_id)
@@ -3020,6 +3024,9 @@ impl App {
         let header = widget::header_bar()
             .title(title_snippet)
             .on_drag(Message::DragThreadWindow(win_id))
+            .on_double_click(Message::MaximizeThreadWindow(win_id))
+            .on_minimize(Message::MinimizeThreadWindow(win_id))
+            .on_maximize(Message::MaximizeThreadWindow(win_id))
             .on_close(Message::CloseThreadWindow(win_id));
 
         let live_summary = self.inbox.threads.iter().find(|t| t.id == state.thread_id);
@@ -3171,8 +3178,11 @@ impl App {
         let mut col = widget::column::with_capacity(messages.len() + 1)
             .spacing(14)
             .padding(20)
-            .max_width(840.0)
+            .width(Length::Fill)
             .push(widget::text::title3(thread_subject));
+        if window_id.is_none() {
+            col = col.max_width(840.0);
+        }
 
         for (msg_idx, msg) in messages.iter().enumerate() {
             let primary_sender = msg.from.first();
