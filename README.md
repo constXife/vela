@@ -22,12 +22,30 @@ Lightweight native email client for the COSMIC desktop on Linux, built in Rust w
 
 ## Quick Start
 
+### Nix (NixOS / Home Manager / Nix Flakes)
+
 ```bash
-# Run with Nix dev shell (recommended)
+# Run Vela directly
+nix run github:constXife/vela
+
+# Try with built-in sample data
+nix run github:constXife/vela -- --sample
+
+# Install Vela (vela-cosmic + vela-mcp + desktop entry + icon) into your profile
+nix profile install github:constXife/vela
+
+# Run the headless MCP server
+nix run github:constXife/vela#vela-mcp
+```
+
+### Build from Source
+
+```bash
+# Run with Nix dev shell
 nix develop -c cargo run --release -p vela-cosmic
 
-# Or try without an account using built-in sample data
-nix develop -c cargo run --release -p vela-cosmic -- --sample
+# Or install locally (~/.local) via just
+just prefix=~/.local install
 ```
 
 ### MCP Server

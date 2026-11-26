@@ -34,8 +34,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 zeroize = { version = "1", features = ["derive"] }
 
-# Pin libcosmic to a reproducible commit on master.
-libcosmic = { git = "https://github.com/pop-os/libcosmic", rev = "009fb9d4138f25615122c4ccc42d025472da9cdd", features = [
+# Pinned in Cargo.lock to a reproducible libcosmic commit.
+libcosmic = { git = "https://github.com/pop-os/libcosmic", features = [
     "multi-window",
     "single-instance",
     "wgpu",
