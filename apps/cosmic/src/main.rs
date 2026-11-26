@@ -13,9 +13,10 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use cosmic::app::context_drawer::{self, ContextDrawer};
 use cosmic::app::{Core, Settings, Task};
 use cosmic::iced::core::layout::Limits;
-use cosmic::iced::{Alignment, Color, Event, Length, Size, Subscription, event, keyboard};
+use cosmic::iced::{Alignment, Color, Event, Length, Size, Subscription, event, keyboard, mouse};
 use cosmic::{Element, executor, widget};
 use jiff::{Timestamp, Zoned, tz::TimeZone};
 use vela_cache::VelaCache;
@@ -106,6 +107,15 @@ impl ConnectForm {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResizeHandle {
+    Sidebar,
+    Threads,
+}
+
+const DEFAULT_SIDEBAR_WIDTH: f32 = 220.0;
+const DEFAULT_THREADS_WIDTH: f32 = 370.0;
+
 struct App {
     core: Core,
     screen: Screen,
@@ -119,6 +129,12 @@ struct App {
     downloading_blobs: HashSet<BlobId>,
     last_saved_attachment: Option<PathBuf>,
     show_shortcuts: bool,
+    show_settings: bool,
+    show_sidebar: bool,
+    sidebar_width: f32,
+    threads_width: f32,
+    resizing: Option<ResizeHandle>,
+    auto_mark_read: bool,
 }
 
 type ConnectedAccount = (String, Arc<JmapSession>, Vec<Mailbox>, String);
@@ -196,6 +212,16 @@ enum Message {
     ToggleShortcuts,
     CloseShortcuts,
     EscapePressed,
+    ToggleSidebar,
+    ToggleSettings,
+    CloseSettings,
+    ToggleAutoMarkRead(bool),
+    StartResize(ResizeHandle),
+    ResizeMove(f32),
+    EndResize,
+    ResetPaneWidths,
+    ClearCacheAndResync,
+    CacheCleared(Option<Arc<VelaCache>>),
 }
 
 impl App {
@@ -203,6 +229,15 @@ impl App {
         if let Ok(cfg) = store::load_accounts_config() {
             self.accounts = cfg.accounts;
         }
+    }
+
+    fn selected_thread_is_unread(&self) -> bool {
+        self.inbox
+            .selected_thread
+            .as_ref()
+            .and_then(|id| self.inbox.threads.iter().find(|t| &t.id == id))
+            .map(|t| t.unread)
+            .unwrap_or(false)
     }
 
     fn dispatch(&mut self, event: InboxEvent) -> Task<Message> {
@@ -423,6 +458,12 @@ impl cosmic::Application for App {
             downloading_blobs: HashSet::new(),
             last_saved_attachment: None,
             show_shortcuts: false,
+            show_settings: false,
+            show_sidebar: true,
+            sidebar_width: DEFAULT_SIDEBAR_WIDTH,
+            threads_width: DEFAULT_THREADS_WIDTH,
+            resizing: None,
+            auto_mark_read: false,
         };
 
         if flags.sample_mode {
@@ -445,13 +486,23 @@ impl cosmic::Application for App {
             return Subscription::none();
         }
 
-        event::listen_with(|ev, status, _window| {
+        let keys = event::listen_with(|ev, status, _window| {
             if matches!(status, event::Status::Captured) {
                 return None;
             }
             let Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) = ev else {
                 return None;
             };
+            if modifiers.control() && !modifiers.alt() && !modifiers.logo() {
+                if let keyboard::Key::Character(ref c) = key {
+                    return match c.as_str() {
+                        "b" => Some(Message::ToggleSidebar),
+                        "," => Some(Message::ToggleSettings),
+                        _ => None,
+                    };
+                }
+                return None;
+            }
             if modifiers.control() || modifiers.alt() || modifiers.logo() {
                 return None;
             }
@@ -472,11 +523,27 @@ impl cosmic::Application for App {
                     "r" => Some(Message::SyncNow),
                     "/" => Some(Message::FocusSearch),
                     "?" => Some(Message::ToggleShortcuts),
+                    "\\" => Some(Message::ToggleSidebar),
                     _ => None,
                 },
                 _ => None,
             }
-        })
+        });
+
+        if self.resizing.is_some() {
+            let drag = event::listen_with(|ev, _status, _window| match ev {
+                Event::Mouse(mouse::Event::CursorMoved { position }) => {
+                    Some(Message::ResizeMove(position.x))
+                }
+                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
+                    Some(Message::EndResize)
+                }
+                _ => None,
+            });
+            Subscription::batch([keys, drag])
+        } else {
+            keys
+        }
     }
 
     fn update(&mut self, message: Self::Message) -> Task<Self::Message> {
@@ -774,9 +841,27 @@ impl cosmic::Application for App {
                 }
                 Err(err) => self.dispatch(InboxEvent::ReportError(err)),
             },
-            Message::SelectThread(id) => self.dispatch(InboxEvent::SelectThread(id)),
-            Message::SelectNext => self.dispatch(InboxEvent::SelectNextThread),
-            Message::SelectPrev => self.dispatch(InboxEvent::SelectPrevThread),
+            Message::SelectThread(id) => {
+                let mut tasks = vec![self.dispatch(InboxEvent::SelectThread(id))];
+                if self.auto_mark_read && self.selected_thread_is_unread() {
+                    tasks.push(self.dispatch(InboxEvent::ToggleSelectedRead));
+                }
+                Task::batch(tasks)
+            }
+            Message::SelectNext => {
+                let mut tasks = vec![self.dispatch(InboxEvent::SelectNextThread)];
+                if self.auto_mark_read && self.selected_thread_is_unread() {
+                    tasks.push(self.dispatch(InboxEvent::ToggleSelectedRead));
+                }
+                Task::batch(tasks)
+            }
+            Message::SelectPrev => {
+                let mut tasks = vec![self.dispatch(InboxEvent::SelectPrevThread)];
+                if self.auto_mark_read && self.selected_thread_is_unread() {
+                    tasks.push(self.dispatch(InboxEvent::ToggleSelectedRead));
+                }
+                Task::batch(tasks)
+            }
             Message::ConversationLoaded {
                 op_id,
                 thread_id,
@@ -968,12 +1053,141 @@ impl cosmic::Application for App {
                 if self.show_shortcuts {
                     self.show_shortcuts = false;
                     Task::none()
+                } else if self.show_settings {
+                    self.show_settings = false;
+                    self.core.window.show_context = false;
+                    Task::none()
                 } else if self.inbox.has_active_filter() {
                     self.dispatch(InboxEvent::ClearFilters)
                 } else {
                     Task::none()
                 }
             }
+            Message::ToggleSidebar => {
+                self.show_sidebar = !self.show_sidebar;
+                Task::none()
+            }
+            Message::ToggleSettings => {
+                self.show_settings = !self.show_settings;
+                self.core.window.show_context = self.show_settings;
+                Task::none()
+            }
+            Message::CloseSettings => {
+                self.show_settings = false;
+                self.core.window.show_context = false;
+                Task::none()
+            }
+            Message::ToggleAutoMarkRead(enabled) => {
+                self.auto_mark_read = enabled;
+                Task::none()
+            }
+            Message::StartResize(handle) => {
+                self.resizing = Some(handle);
+                Task::none()
+            }
+            Message::ResizeMove(x) => {
+                match self.resizing {
+                    Some(ResizeHandle::Sidebar) => {
+                        self.sidebar_width = x.clamp(160.0, 320.0);
+                    }
+                    Some(ResizeHandle::Threads) => {
+                        let left_offset = if self.show_sidebar {
+                            self.sidebar_width + 7.0
+                        } else {
+                            0.0
+                        };
+                        self.threads_width = (x - left_offset).clamp(280.0, 560.0);
+                    }
+                    None => {}
+                }
+                Task::none()
+            }
+            Message::EndResize => {
+                self.resizing = None;
+                Task::none()
+            }
+            Message::ResetPaneWidths => {
+                self.sidebar_width = DEFAULT_SIDEBAR_WIDTH;
+                self.threads_width = DEFAULT_THREADS_WIDTH;
+                Task::none()
+            }
+            Message::ClearCacheAndResync => {
+                let account_id = self.active_account_id.clone();
+                self.cache = None;
+                self.sync_states = SyncStates::default();
+                cosmic::task::future(async move {
+                    let rebuilt = if let Some(aid) = account_id {
+                        let _ = tokio::task::spawn_blocking({
+                            let aid = aid.clone();
+                            move || vela_cache::destroy_account_cache(&aid)
+                        })
+                        .await;
+                        match store::load_or_create_cache_key_for(&aid).await {
+                            Ok(key) => tokio::task::spawn_blocking(move || {
+                                VelaCache::open_for_account(&aid, &key).ok().map(Arc::new)
+                            })
+                            .await
+                            .ok()
+                            .flatten(),
+                            Err(_) => None,
+                        }
+                    } else {
+                        None
+                    };
+                    Message::CacheCleared(rebuilt)
+                })
+            }
+            Message::CacheCleared(rebuilt) => {
+                self.cache = rebuilt;
+                self.inbox.status_banner = Some("Local cache cleared — syncing…".into());
+                self.update(Message::SyncNow)
+            }
+        }
+    }
+
+    fn header_start(&self) -> Vec<Element<'_, Self::Message>> {
+        if !matches!(self.screen, Screen::Inbox) {
+            return Vec::new();
+        }
+        vec![
+            widget::tooltip(
+                widget::nav_bar_toggle()
+                    .active(self.show_sidebar)
+                    .on_toggle(Message::ToggleSidebar),
+                widget::text::caption("Toggle sidebar (Ctrl+B)"),
+                widget::tooltip::Position::Bottom,
+            )
+            .into(),
+            widget::container(widget::text::heading("Vela"))
+                .padding([0, 8])
+                .align_y(Alignment::Center)
+                .into(),
+        ]
+    }
+
+    fn header_end(&self) -> Vec<Element<'_, Self::Message>> {
+        if !matches!(self.screen, Screen::Inbox) {
+            return Vec::new();
+        }
+        vec![
+            widget::tooltip(
+                widget::button::icon(widget::icon::from_name("preferences-system-symbolic"))
+                    .on_press(Message::ToggleSettings),
+                widget::text::caption("Settings (Ctrl+,)"),
+                widget::tooltip::Position::Bottom,
+            )
+            .into(),
+        ]
+    }
+
+    fn context_drawer(&self) -> Option<ContextDrawer<'_, Self::Message>> {
+        if self.show_settings && matches!(self.screen, Screen::Inbox) {
+            Some(
+                context_drawer::context_drawer(self.view_settings_drawer(), Message::CloseSettings)
+                    .title("Settings"),
+            )
+        } else {
+            None
         }
     }
 
@@ -997,6 +1211,73 @@ impl cosmic::Application for App {
 }
 
 impl App {
+    fn view_settings_drawer(&self) -> Element<'_, Message> {
+        let reading_section = widget::settings::section()
+            .title("Reading & Privacy")
+            .add(
+                widget::settings::item::builder("Auto-mark read on open")
+                    .description("Automatically mark threads as read when selected")
+                    .toggler(self.auto_mark_read, Message::ToggleAutoMarkRead),
+            )
+            .add(
+                widget::settings::item::builder("External images")
+                    .description("Blocked by default to prevent tracking pixels")
+                    .control(
+                        widget::text::caption("Blocked")
+                            .class(cosmic::theme::Text::Custom(muted_text_style)),
+                    ),
+            );
+
+        let layout_section = widget::settings::section()
+            .title("Layout")
+            .add(
+                widget::settings::item::builder("Mailboxes sidebar")
+                    .description("Show or hide the left folder column (Ctrl+B)")
+                    .toggler(self.show_sidebar, |_| Message::ToggleSidebar),
+            )
+            .add(
+                widget::settings::item::builder("Pane widths")
+                    .description("Drag dividers between panes to resize")
+                    .control(widget::button::standard("Reset").on_press(Message::ResetPaneWidths)),
+            );
+
+        let mut cache_section = widget::settings::section().title("Encrypted Cache").add(
+            widget::settings::item::builder("Local storage")
+                .description("SQLCipher AES-256 with key in OS Keyring")
+                .control(
+                    widget::text::caption(if self.cache.is_some() {
+                        "Active"
+                    } else {
+                        "Sample"
+                    })
+                    .class(cosmic::theme::Text::Custom(muted_text_style)),
+                ),
+        );
+        if self.session.is_some() {
+            cache_section = cache_section.add(
+                widget::settings::item::builder("Rebuild cache")
+                    .description("Wipe local cache and re-sync from JMAP")
+                    .control(
+                        widget::button::standard("Clear & Sync")
+                            .on_press(Message::ClearCacheAndResync),
+                    ),
+            );
+        }
+
+        let accounts_section = widget::settings::section().title("Accounts").add(
+            widget::settings::item::builder("Connected accounts")
+                .description(format!("{} saved JMAP account(s)", self.accounts.len()))
+                .control(widget::button::standard("Add account").on_press(Message::OpenAddAccount)),
+        );
+
+        widget::column::with_capacity(4)
+            .spacing(16)
+            .push(reading_section)
+            .push(layout_section)
+            .push(cache_section)
+            .push(accounts_section)
+            .into()
+    }
     fn view_shortcuts_dialog(&self) -> Element<'_, Message> {
         let content = widget::column::with_capacity(6)
             .spacing(12)
@@ -1024,6 +1305,8 @@ impl App {
                 &[
                     ("/", "Focus search bar"),
                     ("R", "Sync mailboxes & threads"),
+                    ("Ctrl+B  /  \\", "Toggle Mailboxes sidebar"),
+                    ("Ctrl+,", "Open / close Settings"),
                     ("Esc", "Close dialog / clear filters"),
                     ("?", "Toggle this shortcuts overlay"),
                 ],
@@ -1096,18 +1379,23 @@ impl App {
     }
 
     fn view_inbox(&self) -> Element<'_, Message> {
-        let mailboxes_col = self.view_mailboxes();
         let threads_col = self.view_threads();
         let conversation_col = self.view_conversation();
 
-        let panes = widget::row::with_capacity(5)
-            .push(mailboxes_col)
-            .push(widget::divider::vertical::default())
-            .push(threads_col)
-            .push(widget::divider::vertical::default())
-            .push(conversation_col)
+        let mut panes = widget::row::with_capacity(5)
             .width(Length::Fill)
             .height(Length::Fill);
+
+        if self.show_sidebar {
+            panes = panes
+                .push(self.view_mailboxes())
+                .push(pane_resize_handle(ResizeHandle::Sidebar));
+        }
+
+        panes = panes
+            .push(threads_col)
+            .push(pane_resize_handle(ResizeHandle::Threads))
+            .push(conversation_col);
 
         let mut root = widget::column::with_capacity(3)
             .push(panes)
@@ -1262,7 +1550,7 @@ impl App {
             .push(widget::scrollable(list).height(Length::Fill))
             .push(widget::divider::horizontal::default())
             .push(widget::container(footer_col).padding(8))
-            .width(Length::Fixed(220.0))
+            .width(Length::Fixed(self.sidebar_width))
             .height(Length::Fill);
 
         sidebar.into()
@@ -1489,7 +1777,7 @@ impl App {
             .push(widget::divider::horizontal::default())
             .push(search_bar)
             .push(widget::scrollable(list).height(Length::Fill))
-            .width(Length::Fixed(370.0))
+            .width(Length::Fixed(self.threads_width))
             .height(Length::Fill)
             .into()
     }
@@ -1989,6 +2277,17 @@ fn spawn_account_load_tasks(account_id: String) -> Task<Message> {
     });
 
     Task::batch([warm_cache_task, connect_task])
+}
+
+fn pane_resize_handle(handle: ResizeHandle) -> Element<'static, Message> {
+    let divider = widget::container(widget::divider::vertical::default())
+        .center_x(Length::Fixed(7.0))
+        .height(Length::Fill);
+
+    widget::mouse_area(divider)
+        .interaction(mouse::Interaction::ResizingHorizontally)
+        .on_press(Message::StartResize(handle))
+        .into()
 }
 
 fn search_input_id() -> widget::Id {
