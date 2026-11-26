@@ -10,6 +10,7 @@
 mod sample;
 
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use cosmic::app::{Core, Settings, Task};
@@ -19,8 +20,8 @@ use cosmic::{Element, executor, widget};
 use jiff::{Timestamp, Zoned, tz::TimeZone};
 use vela_cache::VelaCache;
 use vela_core::{
-    EmailAddress, Mailbox, MailboxId, MailboxRole, Message as MailMessage, MessageId,
-    RemoteImagePolicy, ThreadId, ThreadSummary,
+    Attachment, BlobId, EmailAddress, Mailbox, MailboxId, MailboxRole, Message as MailMessage,
+    MessageId, RemoteImagePolicy, ThreadId, ThreadSummary,
 };
 use vela_flows::{InboxEffect, InboxEvent, InboxState, ThreadFilter, TriageAction, html};
 use vela_jmap::{JmapConfig, JmapCredentials, JmapSession, ThreadMutation, store};
@@ -111,6 +112,8 @@ struct App {
     cache: Option<Arc<VelaCache>>,
     account: Option<(String, String)>,
     syncing: bool,
+    downloading_blobs: HashSet<BlobId>,
+    last_saved_attachment: Option<PathBuf>,
 }
 
 type ConnectedAccount = (Arc<JmapSession>, Vec<Mailbox>);
@@ -168,6 +171,12 @@ enum Message {
     ClearFilters,
     SyncNow,
     SyncMailboxesFinished(Result<Vec<Mailbox>, String>),
+    DownloadAttachment(Attachment),
+    AttachmentDownloaded {
+        blob_id: BlobId,
+        result: Result<PathBuf, String>,
+    },
+    OpenSavedAttachment(PathBuf),
 }
 
 impl App {
@@ -357,6 +366,8 @@ impl cosmic::Application for App {
             cache: None,
             account: initial_account,
             syncing: !flags.sample_mode,
+            downloading_blobs: HashSet::new(),
+            last_saved_attachment: None,
         };
 
         if flags.sample_mode {
@@ -757,6 +768,58 @@ impl cosmic::Application for App {
                 self.syncing = false;
                 self.dispatch(InboxEvent::ReportError(format!("Sync failed: {err}")))
             }
+            Message::DownloadAttachment(attachment) => {
+                if !self.downloading_blobs.insert(attachment.blob_id.clone()) {
+                    return Task::none();
+                }
+                let blob_id = attachment.blob_id.clone();
+                let filename = attachment
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| "attachment".to_string());
+                let session = self.session.clone();
+                cosmic::task::future(async move {
+                    let result = async {
+                        let bytes = if let Some(session) = session {
+                            session
+                                .download_attachment(&blob_id)
+                                .await
+                                .map_err(|e| e.to_string())?
+                        } else {
+                            format!("Sample attachment placeholder for {filename}\n").into_bytes()
+                        };
+                        tokio::task::spawn_blocking(move || save_to_downloads(&filename, &bytes))
+                            .await
+                            .map_err(|e| e.to_string())?
+                    }
+                    .await;
+                    Message::AttachmentDownloaded { blob_id, result }
+                })
+            }
+            Message::AttachmentDownloaded { blob_id, result } => {
+                self.downloading_blobs.remove(&blob_id);
+                match result {
+                    Ok(path) => {
+                        self.last_saved_attachment = Some(path.clone());
+                        self.inbox.last_undo = None;
+                        self.inbox.status_banner =
+                            Some(format!("Saved attachment to {}", path.display()));
+                        Task::none()
+                    }
+                    Err(err) => self.dispatch(InboxEvent::ReportError(format!(
+                        "Attachment download failed: {err}"
+                    ))),
+                }
+            }
+            Message::OpenSavedAttachment(path) => {
+                if let Err(err) = std::process::Command::new("xdg-open").arg(&path).spawn() {
+                    return self.dispatch(InboxEvent::ReportError(format!(
+                        "Failed to open {}: {err}",
+                        path.display()
+                    )));
+                }
+                Task::none()
+            }
         }
     }
 
@@ -853,6 +916,11 @@ impl App {
                 .spacing(12);
             if self.inbox.last_undo.is_some() {
                 row = row.push(widget::button::text("Undo (Z)").on_press(Message::Undo));
+            } else if let Some(path) = &self.last_saved_attachment {
+                row = row.push(
+                    widget::button::text("Open")
+                        .on_press(Message::OpenSavedAttachment(path.clone())),
+                );
             }
             let status_bar = widget::container(row).padding([8, 16]).width(Length::Fill);
             root = root
@@ -1493,24 +1561,57 @@ impl App {
             let regular_attachments: Vec<_> =
                 msg.attachments.iter().filter(|a| !a.is_inline).collect();
             if !regular_attachments.is_empty() {
-                let summary = regular_attachments
-                    .iter()
-                    .map(|a| {
-                        let name = a.name.as_deref().unwrap_or("attachment");
-                        format!("{name} ({} KB)", (a.size / 1024).max(1))
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" · ");
-                card = card.push(widget::divider::horizontal::light()).push(
-                    widget::row::with_capacity(2)
-                        .push(widget::icon::from_name("mail-attachment-symbolic").size(16))
-                        .push(
-                            widget::text::caption(summary)
-                                .class(cosmic::theme::Text::Custom(muted_text_style)),
-                        )
+                let mut chips: Vec<Element<'_, Message>> =
+                    Vec::with_capacity(regular_attachments.len());
+                for att in regular_attachments {
+                    let name = html::clean_snippet(att.name.as_deref().unwrap_or("attachment"), 36);
+                    let downloading = self.downloading_blobs.contains(&att.blob_id);
+                    let size_label = if downloading {
+                        "Downloading…".to_string()
+                    } else {
+                        format_file_size(att.size)
+                    };
+
+                    let chip_content = widget::row::with_capacity(3)
                         .spacing(8)
-                        .align_y(Alignment::Center),
-                );
+                        .align_y(Alignment::Center)
+                        .push(
+                            widget::icon::from_name(attachment_icon_name(&att.mime_type)).size(16),
+                        )
+                        .push(
+                            widget::column::with_capacity(2)
+                                .spacing(1)
+                                .push(
+                                    widget::text::body(name)
+                                        .class(cosmic::theme::Text::Custom(primary_text_style)),
+                                )
+                                .push(
+                                    widget::text::caption(size_label)
+                                        .class(cosmic::theme::Text::Custom(muted_text_style)),
+                                ),
+                        )
+                        .push(widget::icon::from_name("document-save-symbolic").size(16));
+
+                    let mut btn = widget::button::custom(chip_content)
+                        .class(cosmic::theme::Button::ListItem([8.0; 4]))
+                        .padding([8, 12]);
+                    if !downloading {
+                        btn = btn.on_press(Message::DownloadAttachment(att.clone()));
+                    }
+
+                    chips.push(
+                        widget::tooltip(
+                            widget::container(btn).class(cosmic::theme::Container::Primary),
+                            widget::text::caption("Save to Downloads"),
+                            widget::tooltip::Position::Bottom,
+                        )
+                        .into(),
+                    );
+                }
+
+                card = card
+                    .push(widget::divider::horizontal::light())
+                    .push(widget::flex_row(chips).row_spacing(8).column_spacing(8));
             }
 
             col = col.push(
@@ -1660,4 +1761,76 @@ fn avatar_container_style(theme: &cosmic::Theme) -> widget::container::Style {
         },
         ..Default::default()
     }
+}
+
+fn attachment_icon_name(mime: &str) -> &'static str {
+    let lower = mime.to_ascii_lowercase();
+    if lower.starts_with("image/") {
+        "image-x-generic-symbolic"
+    } else if lower.starts_with("text/") {
+        "text-x-generic-symbolic"
+    } else {
+        "mail-attachment-symbolic"
+    }
+}
+
+fn format_file_size(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * 1024;
+    if bytes >= MIB {
+        format!("{:.1} MB", bytes as f64 / MIB as f64)
+    } else if bytes >= KIB {
+        format!("{} KB", bytes / KIB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+fn save_to_downloads(raw_name: &str, bytes: &[u8]) -> Result<PathBuf, String> {
+    let base_dir = dirs::download_dir()
+        .or_else(|| dirs::home_dir().map(|h| h.join("Downloads")))
+        .ok_or_else(|| "unable to determine Downloads directory".to_string())?;
+    std::fs::create_dir_all(&base_dir).map_err(|e| e.to_string())?;
+
+    // Sanitize filename to prevent path traversal from untrusted headers.
+    let safe_name: String = raw_name
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or("attachment")
+        .chars()
+        .filter(|c| !c.is_control() && !matches!(c, '/' | '\\' | '\0'))
+        .collect();
+    let safe_name = safe_name.trim_matches('.');
+    let safe_name = if safe_name.is_empty() {
+        "attachment"
+    } else {
+        safe_name
+    };
+
+    let candidate = base_dir.join(safe_name);
+    let dest = if !candidate.exists() {
+        candidate
+    } else {
+        let stem = candidate
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("attachment");
+        let ext = candidate.extension().and_then(|e| e.to_str());
+        let mut chosen = None;
+        for n in 1..1000 {
+            let numbered = match ext {
+                Some(ext) => format!("{stem} ({n}).{ext}"),
+                None => format!("{stem} ({n})"),
+            };
+            let path = base_dir.join(numbered);
+            if !path.exists() {
+                chosen = Some(path);
+                break;
+            }
+        }
+        chosen.ok_or_else(|| "too many duplicate attachment files".to_string())?
+    };
+
+    std::fs::write(&dest, bytes).map_err(|e| e.to_string())?;
+    Ok(dest)
 }

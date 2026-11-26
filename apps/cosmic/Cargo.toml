@@ -10,6 +10,7 @@ name = "vela-cosmic"
 path = "src/main.rs"
 
 [dependencies]
+dirs.workspace = true
 jiff.workspace = true
 libcosmic.workspace = true
 tokio.workspace = true

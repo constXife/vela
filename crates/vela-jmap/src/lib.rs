@@ -22,6 +22,8 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// Maximum inline blob size fetched automatically (10 MiB).
 const MAX_INLINE_BLOB_BYTES: usize = 10 * 1024 * 1024;
+/// Maximum explicit attachment download size (50 MiB).
+const MAX_ATTACHMENT_BYTES: usize = 50 * 1024 * 1024;
 
 /// Authentication credentials kept in memory and wiped on drop.
 ///
@@ -456,14 +458,29 @@ impl JmapSession {
 
     /// Download a blob (inline image or attachment) with a size ceiling.
     pub async fn download_blob(&self, blob_id: &BlobId) -> Result<Vec<u8>, VelaError> {
+        self.download_with_limit(blob_id, MAX_INLINE_BLOB_BYTES)
+            .await
+    }
+
+    /// Download an explicit user-requested attachment up to 50 MiB.
+    pub async fn download_attachment(&self, blob_id: &BlobId) -> Result<Vec<u8>, VelaError> {
+        self.download_with_limit(blob_id, MAX_ATTACHMENT_BYTES)
+            .await
+    }
+
+    async fn download_with_limit(
+        &self,
+        blob_id: &BlobId,
+        limit: usize,
+    ) -> Result<Vec<u8>, VelaError> {
         let bytes = self
             .client
             .download(&blob_id.0)
             .await
             .map_err(|err| VelaError::Transport(err.to_string()))?;
-        if bytes.len() > MAX_INLINE_BLOB_BYTES {
+        if bytes.len() > limit {
             return Err(VelaError::Other(format!(
-                "blob {} exceeds inline limit ({} bytes)",
+                "blob {} exceeds download limit ({} bytes)",
                 blob_id.0,
                 bytes.len()
             )));
