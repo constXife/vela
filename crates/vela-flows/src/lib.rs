@@ -28,13 +28,16 @@ pub enum ThreadFilter {
     #[default]
     All,
     Unread,
+    Flagged,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TriageAction {
     Archive,
     Trash,
+    MoveToInbox,
     ToggleRead { mark_unread: bool },
+    ToggleFlag { flagged: bool },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -94,7 +97,9 @@ pub enum InboxEvent {
     },
     ArchiveSelected,
     TrashSelected,
+    MoveSelectedToInbox,
     ToggleSelectedRead,
+    ToggleSelectedFlag,
     UndoLastTriage,
     AllowRemoteImages(MessageId),
     ToggleQuote(MessageId),
@@ -180,8 +185,18 @@ impl InboxState {
         self.threads
             .iter()
             .filter(|thread| {
-                if self.filter == ThreadFilter::Unread && !thread.unread {
-                    return false;
+                match self.filter {
+                    ThreadFilter::All => {}
+                    ThreadFilter::Unread => {
+                        if !thread.unread {
+                            return false;
+                        }
+                    }
+                    ThreadFilter::Flagged => {
+                        if !thread.flagged {
+                            return false;
+                        }
+                    }
                 }
                 if query.is_empty() {
                     return true;
@@ -366,7 +381,11 @@ impl InboxState {
             InboxEvent::TrashSelected => {
                 self.move_selected(TriageAction::Trash, MailboxRole::Trash)
             }
+            InboxEvent::MoveSelectedToInbox => {
+                self.move_selected(TriageAction::MoveToInbox, MailboxRole::Inbox)
+            }
             InboxEvent::ToggleSelectedRead => self.toggle_selected_read(),
+            InboxEvent::ToggleSelectedFlag => self.toggle_selected_flag(),
             InboxEvent::UndoLastTriage => self.undo_last_triage(),
             InboxEvent::AllowRemoteImages(message_id) => {
                 self.remote_image_policies
@@ -553,8 +572,21 @@ impl InboxState {
         };
 
         let target_mailbox = self.mailbox_by_role(role).map(|m| m.id.clone());
+        // Don't move a thread into the mailbox we're already viewing.
+        if target_mailbox.is_some() && target_mailbox == self.selected_mailbox {
+            return Vec::new();
+        }
         let removed = self.threads.remove(idx);
         let op_id = self.alloc_op();
+
+        if removed.unread {
+            if let Some(src_id) = self.selected_mailbox.clone() {
+                self.adjust_mailbox_unread(&src_id, -1);
+            }
+            if let Some(dst_id) = &target_mailbox {
+                self.adjust_mailbox_unread(dst_id, 1);
+            }
+        }
 
         self.last_undo = Some(UndoEntry {
             action: action.clone(),
@@ -566,7 +598,10 @@ impl InboxState {
             TriageAction::Trash => {
                 format!("Moved «{}» to Trash — press Z to undo", removed.subject)
             }
-            TriageAction::ToggleRead { .. } => String::new(),
+            TriageAction::MoveToInbox => {
+                format!("Restored «{}» to Inbox — press Z to undo", removed.subject)
+            }
+            TriageAction::ToggleRead { .. } | TriageAction::ToggleFlag { .. } => String::new(),
         });
 
         let mut effects = vec![InboxEffect::ApplyTriage {
@@ -576,14 +611,19 @@ impl InboxState {
             target_mailbox,
         }];
 
-        // Immediately advance selection to the next remaining thread.
-        if self.threads.is_empty() {
+        // Immediately advance selection to the next remaining visible thread.
+        let remaining_visible: Vec<ThreadId> = self
+            .visible_threads()
+            .into_iter()
+            .map(|t| t.id.clone())
+            .collect();
+        if remaining_visible.is_empty() {
             self.selected_thread = None;
             self.conversation.clear();
             self.loading_conversation = false;
         } else {
-            let next_idx = idx.min(self.threads.len() - 1);
-            let next_id = self.threads[next_idx].id.clone();
+            let next_idx = idx.min(remaining_visible.len() - 1);
+            let next_id = remaining_visible[next_idx].clone();
             effects.extend(self.select_thread(next_id));
         }
 
@@ -599,13 +639,38 @@ impl InboxState {
         };
         thread.unread = !thread.unread;
         let mark_unread = thread.unread;
+        if let Some(mb_id) = self.selected_mailbox.clone() {
+            self.adjust_mailbox_unread(&mb_id, if mark_unread { 1 } else { -1 });
+        }
         let op_id = self.alloc_op();
-        vec![InboxEffect::ApplyTriage {
+        let mut effects = vec![InboxEffect::ApplyTriage {
             op_id,
             thread_id: selected_id,
             action: TriageAction::ToggleRead { mark_unread },
             target_mailbox: None,
-        }]
+        }];
+        effects.extend(self.ensure_selection_visible());
+        effects
+    }
+
+    fn toggle_selected_flag(&mut self) -> Vec<InboxEffect> {
+        let Some(selected_id) = self.selected_thread.clone() else {
+            return Vec::new();
+        };
+        let Some(thread) = self.threads.iter_mut().find(|t| t.id == selected_id) else {
+            return Vec::new();
+        };
+        thread.flagged = !thread.flagged;
+        let flagged = thread.flagged;
+        let op_id = self.alloc_op();
+        let mut effects = vec![InboxEffect::ApplyTriage {
+            op_id,
+            thread_id: selected_id,
+            action: TriageAction::ToggleFlag { flagged },
+            target_mailbox: None,
+        }];
+        effects.extend(self.ensure_selection_visible());
+        effects
     }
 
     fn undo_last_triage(&mut self) -> Vec<InboxEffect> {
@@ -615,8 +680,26 @@ impl InboxState {
         let insert_at = entry.index.min(self.threads.len());
         let thread_id = entry.thread.id.clone();
         let mailbox_ids = entry.thread.mailbox_ids.clone();
+        let was_unread = entry.thread.unread;
         self.threads.insert(insert_at, entry.thread);
         self.status_banner = Some("Action undone".to_string());
+
+        if was_unread {
+            if let Some(cur_id) = self.selected_mailbox.clone() {
+                self.adjust_mailbox_unread(&cur_id, 1);
+            }
+            let target_role = match entry.action {
+                TriageAction::Archive => Some(MailboxRole::Archive),
+                TriageAction::Trash => Some(MailboxRole::Trash),
+                TriageAction::MoveToInbox => Some(MailboxRole::Inbox),
+                TriageAction::ToggleRead { .. } | TriageAction::ToggleFlag { .. } => None,
+            };
+            if let Some(role) = target_role
+                && let Some(dst_id) = self.mailbox_by_role(role).map(|m| m.id.clone())
+            {
+                self.adjust_mailbox_unread(&dst_id, -1);
+            }
+        }
 
         let op_id = self.alloc_op();
         let mut effects = vec![InboxEffect::RestoreThread {
@@ -626,6 +709,16 @@ impl InboxState {
         }];
         effects.extend(self.select_thread(thread_id));
         effects
+    }
+
+    fn adjust_mailbox_unread(&mut self, mailbox_id: &MailboxId, delta: i32) {
+        if let Some(mb) = self.mailboxes.iter_mut().find(|m| &m.id == mailbox_id) {
+            if delta > 0 {
+                mb.unread_threads = mb.unread_threads.saturating_add(delta as u32);
+            } else {
+                mb.unread_threads = mb.unread_threads.saturating_sub(delta.unsigned_abs());
+            }
+        }
     }
 }
 
@@ -876,5 +969,47 @@ mod tests {
         // Clearing filters restores all threads.
         state.handle(InboxEvent::ClearFilters);
         assert_eq!(state.visible_threads().len(), 3);
+    }
+
+    #[test]
+    fn flag_toggle_restore_to_inbox_and_unread_counters() {
+        let mut state = InboxState::new();
+        state.mailboxes = sample_mailboxes();
+        state.selected_mailbox = Some(MailboxId("mb-trash".into()));
+        let t1 = sample_thread("t-trashed", "Deleted email");
+        state.threads = vec![t1];
+        state.selected_thread = Some(ThreadId("t-trashed".into()));
+
+        // Toggle flag on and verify Flagged filter shows it.
+        let flag_effects = state.handle(InboxEvent::ToggleSelectedFlag);
+        assert!(state.threads[0].flagged);
+        assert!(flag_effects.iter().any(|e| matches!(
+            e,
+            InboxEffect::ApplyTriage {
+                action: TriageAction::ToggleFlag { flagged: true },
+                ..
+            }
+        )));
+        state.handle(InboxEvent::SetFilter(ThreadFilter::Flagged));
+        assert_eq!(state.visible_threads().len(), 1);
+
+        // Restore from Trash to Inbox moves it and increments Inbox unread counter.
+        let restore_effects = state.handle(InboxEvent::MoveSelectedToInbox);
+        assert!(state.threads.is_empty());
+        assert_eq!(
+            state
+                .mailbox_by_role(MailboxRole::Inbox)
+                .unwrap()
+                .unread_threads,
+            3
+        );
+        assert!(restore_effects.iter().any(|e| matches!(
+            e,
+            InboxEffect::ApplyTriage {
+                action: TriageAction::MoveToInbox,
+                target_mailbox: Some(MailboxId(id)),
+                ..
+            } if id == "mb-inbox"
+        )));
     }
 }

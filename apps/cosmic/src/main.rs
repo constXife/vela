@@ -165,7 +165,9 @@ enum Message {
     },
     Archive,
     Trash,
+    RestoreToInbox,
     ToggleRead,
+    ToggleFlag,
     Undo,
     TriageFinished(Result<(), String>),
     AllowRemoteImages(MessageId),
@@ -306,17 +308,31 @@ impl App {
                 target_mailbox,
                 ..
             } => {
+                if let Some(cache) = self.cache.clone() {
+                    let mbs = self.inbox.mailboxes.clone();
+                    let active_mb = self.inbox.selected_mailbox.clone();
+                    let threads = self.inbox.threads.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let _ = cache.save_mailboxes(&mbs);
+                        if let Some(mb) = active_mb {
+                            let _ = cache.save_threads(&mb, &threads);
+                        }
+                    });
+                }
                 let Some(session) = self.session.clone() else {
                     return Task::none();
                 };
                 let mutation = match action {
-                    TriageAction::Archive | TriageAction::Trash => match target_mailbox {
-                        Some(target) => ThreadMutation::MoveToMailbox(target),
-                        None => return Task::none(),
-                    },
+                    TriageAction::Archive | TriageAction::Trash | TriageAction::MoveToInbox => {
+                        match target_mailbox {
+                            Some(target) => ThreadMutation::MoveToMailbox(target),
+                            None => return Task::none(),
+                        }
+                    }
                     TriageAction::ToggleRead { mark_unread } => {
                         ThreadMutation::SetUnread(mark_unread)
                     }
+                    TriageAction::ToggleFlag { flagged } => ThreadMutation::SetFlagged(flagged),
                 };
                 cosmic::task::future(async move {
                     let result = session
@@ -331,6 +347,17 @@ impl App {
                 mailbox_ids,
                 ..
             } => {
+                if let Some(cache) = self.cache.clone() {
+                    let mbs = self.inbox.mailboxes.clone();
+                    let active_mb = self.inbox.selected_mailbox.clone();
+                    let threads = self.inbox.threads.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let _ = cache.save_mailboxes(&mbs);
+                        if let Some(mb) = active_mb {
+                            let _ = cache.save_threads(&mb, &threads);
+                        }
+                    });
+                }
                 let Some(session) = self.session.clone() else {
                     return Task::none();
                 };
@@ -478,6 +505,7 @@ impl cosmic::Application for App {
                     "k" => Some(Message::SelectPrev),
                     "e" => Some(Message::Archive),
                     "u" => Some(Message::ToggleRead),
+                    "s" => Some(Message::ToggleFlag),
                     "z" => Some(Message::Undo),
                     "r" => Some(Message::SyncNow),
                     "/" => Some(Message::FocusSearch),
@@ -770,7 +798,9 @@ impl cosmic::Application for App {
             },
             Message::Archive => self.dispatch(InboxEvent::ArchiveSelected),
             Message::Trash => self.dispatch(InboxEvent::TrashSelected),
+            Message::RestoreToInbox => self.dispatch(InboxEvent::MoveSelectedToInbox),
             Message::ToggleRead => self.dispatch(InboxEvent::ToggleSelectedRead),
+            Message::ToggleFlag => self.dispatch(InboxEvent::ToggleSelectedFlag),
             Message::Undo => self.dispatch(InboxEvent::UndoLastTriage),
             Message::TriageFinished(Ok(())) => Task::none(),
             Message::TriageFinished(Err(err)) => self.dispatch(InboxEvent::ReportError(err)),
@@ -966,6 +996,7 @@ impl App {
                     ("E", "Archive conversation"),
                     ("Del  /  Backspace", "Move to Trash"),
                     ("U", "Toggle Read / Unread"),
+                    ("S", "Flag / Unflag conversation"),
                     ("Z", "Undo last triage action"),
                 ],
             ))
@@ -1215,23 +1246,32 @@ impl App {
             "Unread".to_string()
         };
 
-        let filter_row = widget::row::with_capacity(2)
+        let filter_row = widget::row::with_capacity(3)
             .spacing(4)
             .align_y(Alignment::Center)
             .push(
                 widget::button::custom(widget::text::caption("All"))
                     .class(cosmic::theme::Button::ListItem([6.0; 4]))
                     .selected(self.inbox.filter == ThreadFilter::All)
-                    .padding([4, 10])
+                    .padding([4, 8])
                     .on_press(Message::SetFilter(ThreadFilter::All)),
             )
             .push(
                 widget::button::custom(widget::text::caption(unread_label))
                     .class(cosmic::theme::Button::ListItem([6.0; 4]))
                     .selected(self.inbox.filter == ThreadFilter::Unread)
-                    .padding([4, 10])
+                    .padding([4, 8])
                     .on_press(Message::SetFilter(ThreadFilter::Unread)),
-            );
+            )
+            .push(widget::tooltip(
+                widget::button::custom(widget::icon::from_name("insert-star-symbolic").size(14))
+                    .class(cosmic::theme::Button::ListItem([6.0; 4]))
+                    .selected(self.inbox.filter == ThreadFilter::Flagged)
+                    .padding([5, 7])
+                    .on_press(Message::SetFilter(ThreadFilter::Flagged)),
+                widget::text::caption("Flagged"),
+                widget::tooltip::Position::Bottom,
+            ));
 
         let header = widget::container(
             widget::row::with_capacity(3)
@@ -1280,6 +1320,8 @@ impl App {
         } else if visible_threads.is_empty() {
             let empty_msg = if !self.inbox.search_query.trim().is_empty() {
                 format!("No matches for «{}».", self.inbox.search_query.trim())
+            } else if self.inbox.filter == ThreadFilter::Flagged {
+                "No flagged conversations.".to_string()
             } else {
                 "No unread conversations.".to_string()
             };
@@ -1420,6 +1462,13 @@ impl App {
             .as_ref()
             .and_then(|id| self.inbox.threads.iter().find(|t| &t.id == id));
         let selected_unread = selected_summary.map(|t| t.unread).unwrap_or(false);
+        let selected_flagged = selected_summary.map(|t| t.flagged).unwrap_or(false);
+        let active_role = self
+            .inbox
+            .selected_mailbox
+            .as_ref()
+            .and_then(|id| self.inbox.mailboxes.iter().find(|mb| &mb.id == id))
+            .map(|mb| mb.role);
 
         if self.inbox.conversation.is_empty() && !self.inbox.loading_conversation {
             return widget::container(
@@ -1440,38 +1489,78 @@ impl App {
         } else {
             "mail-mark-unread-symbolic"
         };
+        let flag_label = if selected_flagged { "Unflag" } else { "Flag" };
 
-        let toolbar = widget::container(
-            widget::row::with_capacity(4)
-                .push(widget::tooltip(
+        let mut toolbar_row = widget::row::with_capacity(6)
+            .spacing(8)
+            .align_y(Alignment::Center);
+
+        match active_role {
+            Some(MailboxRole::Trash | MailboxRole::Junk) => {
+                toolbar_row = toolbar_row.push(widget::tooltip(
+                    widget::button::suggested("Restore")
+                        .leading_icon(
+                            widget::icon::from_name("mail-folder-inbox-symbolic").handle(),
+                        )
+                        .on_press(Message::RestoreToInbox),
+                    widget::text::caption("Restore to Inbox"),
+                    widget::tooltip::Position::Bottom,
+                ));
+            }
+            Some(MailboxRole::Archive) => {
+                toolbar_row = toolbar_row.push(widget::tooltip(
+                    widget::button::standard("Move to Inbox")
+                        .leading_icon(
+                            widget::icon::from_name("mail-folder-inbox-symbolic").handle(),
+                        )
+                        .on_press(Message::RestoreToInbox),
+                    widget::text::caption("Move back to Inbox"),
+                    widget::tooltip::Position::Bottom,
+                ));
+            }
+            _ => {
+                toolbar_row = toolbar_row.push(widget::tooltip(
                     widget::button::standard("Archive")
                         .leading_icon(widget::icon::from_name("mail-archive-symbolic").handle())
                         .on_press(Message::Archive),
                     widget::text::caption("Archive (E)"),
                     widget::tooltip::Position::Bottom,
-                ))
-                .push(widget::tooltip(
-                    widget::button::standard(read_label)
-                        .leading_icon(widget::icon::from_name(read_icon).handle())
-                        .on_press(Message::ToggleRead),
-                    widget::text::caption("Toggle Read/Unread (U)"),
-                    widget::tooltip::Position::Bottom,
-                ))
-                .push(widget::space::horizontal())
-                .push(widget::tooltip(
-                    widget::button::standard("Trash")
-                        .leading_icon(widget::icon::from_name("user-trash-symbolic").handle())
-                        .on_press(Message::Trash),
-                    widget::text::caption("Move to Trash (Del)"),
-                    widget::tooltip::Position::Bottom,
-                ))
-                .spacing(8)
-                .align_y(Alignment::Center),
-        )
-        .padding([0, 20])
-        .align_y(Alignment::Center)
-        .height(Length::Fixed(52.0))
-        .width(Length::Fill);
+                ));
+            }
+        }
+
+        toolbar_row = toolbar_row
+            .push(widget::tooltip(
+                widget::button::standard(read_label)
+                    .leading_icon(widget::icon::from_name(read_icon).handle())
+                    .on_press(Message::ToggleRead),
+                widget::text::caption("Toggle Read/Unread (U)"),
+                widget::tooltip::Position::Bottom,
+            ))
+            .push(widget::tooltip(
+                widget::button::standard(flag_label)
+                    .leading_icon(widget::icon::from_name("insert-star-symbolic").handle())
+                    .on_press(Message::ToggleFlag),
+                widget::text::caption("Flag / Unflag (S)"),
+                widget::tooltip::Position::Bottom,
+            ))
+            .push(widget::space::horizontal());
+
+        if active_role != Some(MailboxRole::Trash) {
+            toolbar_row = toolbar_row.push(widget::tooltip(
+                widget::button::standard("Trash")
+                    .leading_icon(widget::icon::from_name("user-trash-symbolic").handle())
+                    .on_press(Message::Trash),
+                widget::text::caption("Move to Trash (Del)"),
+                widget::tooltip::Position::Bottom,
+            ));
+        }
+
+        let toolbar = widget::container(toolbar_row)
+            .padding([0, 20])
+            .align_y(Alignment::Center)
+            .height(Length::Fixed(52.0))
+            .width(Length::Fill);
 
         if self.inbox.conversation.is_empty() {
             let preview_body: Element<'_, Message> = if let Some(summary) = selected_summary {

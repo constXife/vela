@@ -94,6 +94,7 @@ impl JmapConfig {
 pub enum ThreadMutation {
     MoveToMailbox(MailboxId),
     SetUnread(bool),
+    SetFlagged(bool),
     RestoreMailboxes(Vec<MailboxId>),
 }
 
@@ -598,6 +599,9 @@ impl JmapSession {
                 }
                 ThreadMutation::SetUnread(unread) => {
                     patch.keyword("$seen", !unread);
+                }
+                ThreadMutation::SetFlagged(flagged) => {
+                    patch.keyword("$flagged", *flagged);
                 }
                 ThreadMutation::RestoreMailboxes(mailboxes) => {
                     patch.mailbox_ids(mailboxes.iter().map(|m| m.0.as_str()));
