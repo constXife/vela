@@ -23,6 +23,13 @@ const NEIGHBOR_PREFETCH_COUNT: usize = 3;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct OpId(pub u64);
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ThreadFilter {
+    #[default]
+    All,
+    Unread,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TriageAction {
     Archive,
@@ -50,6 +57,9 @@ pub struct InboxState {
     pub expanded_quotes: HashSet<MessageId>,
     pub last_undo: Option<UndoEntry>,
     pub status_banner: Option<String>,
+    pub filter: ThreadFilter,
+    pub search_query: String,
+    pub fts_matches: Option<HashSet<ThreadId>>,
     conversation_cache: HashMap<ThreadId, Vec<Message>>,
     conversation_cache_order: VecDeque<ThreadId>,
     prefetching_threads: HashSet<ThreadId>,
@@ -88,6 +98,12 @@ pub enum InboxEvent {
     UndoLastTriage,
     AllowRemoteImages(MessageId),
     ToggleQuote(MessageId),
+    SetFilter(ThreadFilter),
+    SetSearchQuery {
+        query: String,
+        fts_matches: Option<HashSet<ThreadId>>,
+    },
+    ClearFilters,
     ReportError(String),
 }
 
@@ -136,6 +152,40 @@ impl InboxState {
             .get(message_id)
             .copied()
             .unwrap_or(RemoteImagePolicy::Block)
+    }
+
+    pub fn has_active_filter(&self) -> bool {
+        self.filter != ThreadFilter::All || !self.search_query.trim().is_empty()
+    }
+
+    /// Threads matching the current `All`/`Unread` filter and search query
+    /// (combining live substring matching with SQLCipher FTS5 full-body hits).
+    pub fn visible_threads(&self) -> Vec<&ThreadSummary> {
+        let query = self.search_query.trim().to_lowercase();
+        self.threads
+            .iter()
+            .filter(|thread| {
+                if self.filter == ThreadFilter::Unread && !thread.unread {
+                    return false;
+                }
+                if query.is_empty() {
+                    return true;
+                }
+                if self
+                    .fts_matches
+                    .as_ref()
+                    .is_some_and(|hits| hits.contains(&thread.id))
+                {
+                    return true;
+                }
+                thread.subject.to_lowercase().contains(&query)
+                    || thread.snippet.to_lowercase().contains(&query)
+                    || thread.senders.iter().any(|s| {
+                        s.display_name().to_lowercase().contains(&query)
+                            || s.email.to_lowercase().contains(&query)
+                    })
+            })
+            .collect()
     }
 
     /// Seed the UI state from the local encrypted cache on cold start so the
@@ -314,6 +364,21 @@ impl InboxState {
                 }
                 Vec::new()
             }
+            InboxEvent::SetFilter(filter) => {
+                self.filter = filter;
+                self.ensure_selection_visible()
+            }
+            InboxEvent::SetSearchQuery { query, fts_matches } => {
+                self.search_query = query;
+                self.fts_matches = fts_matches;
+                self.ensure_selection_visible()
+            }
+            InboxEvent::ClearFilters => {
+                self.filter = ThreadFilter::All;
+                self.search_query.clear();
+                self.fts_matches = None;
+                self.ensure_selection_visible()
+            }
             InboxEvent::ReportError(msg) => {
                 self.loading_threads = false;
                 self.loading_conversation = false;
@@ -417,24 +482,50 @@ impl InboxState {
         effects
     }
 
+    fn ensure_selection_visible(&mut self) -> Vec<InboxEffect> {
+        let visible_ids: Vec<ThreadId> = self
+            .visible_threads()
+            .into_iter()
+            .map(|t| t.id.clone())
+            .collect();
+        if let Some(current) = &self.selected_thread
+            && visible_ids.contains(current)
+        {
+            return Vec::new();
+        }
+        if let Some(first) = visible_ids.into_iter().next() {
+            self.select_thread(first)
+        } else {
+            self.selected_thread = None;
+            self.conversation.clear();
+            self.loading_conversation = false;
+            Vec::new()
+        }
+    }
+
     fn step_selection(&mut self, delta: isize) -> Vec<InboxEffect> {
-        if self.threads.is_empty() {
+        let visible_ids: Vec<ThreadId> = self
+            .visible_threads()
+            .into_iter()
+            .map(|t| t.id.clone())
+            .collect();
+        if visible_ids.is_empty() {
             return Vec::new();
         }
         let current = self
             .selected_thread
             .as_ref()
-            .and_then(|id| self.threads.iter().position(|t| &t.id == id));
+            .and_then(|id| visible_ids.iter().position(|vid| vid == id));
 
         let next_idx = match current {
             Some(idx) => {
                 let target = idx as isize + delta;
-                target.clamp(0, (self.threads.len() - 1) as isize) as usize
+                target.clamp(0, (visible_ids.len() - 1) as isize) as usize
             }
             None => 0,
         };
 
-        let next_id = self.threads[next_idx].id.clone();
+        let next_id = visible_ids[next_idx].clone();
         self.select_thread(next_id)
     }
 
@@ -728,5 +819,47 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, InboxEffect::LoadConversation { .. }))
         );
+    }
+
+    #[test]
+    fn filters_by_unread_and_search_query_including_fts_hits() {
+        let mut state = InboxState::new();
+        let mut t1 = sample_thread("t-1", "Invoice from Paddle");
+        t1.unread = false;
+        let t2 = sample_thread("t-2", "Rust weekly digest");
+        let t3 = sample_thread("t-3", "Quick sync");
+        state.threads = vec![t1, t2, t3];
+
+        // Unread filter hides t-1 and advances selection to t-2.
+        state.handle(InboxEvent::SetFilter(ThreadFilter::Unread));
+        let visible: Vec<&str> = state
+            .visible_threads()
+            .into_iter()
+            .map(|t| t.id.0.as_str())
+            .collect();
+        assert_eq!(visible, vec!["t-2", "t-3"]);
+        assert_eq!(state.selected_thread, Some(ThreadId("t-2".into())));
+
+        // Search query matches substring OR FTS5 body hit.
+        let mut fts = HashSet::new();
+        fts.insert(ThreadId("t-3".into()));
+        state.handle(InboxEvent::SetSearchQuery {
+            query: "rust".into(),
+            fts_matches: Some(fts),
+        });
+        let visible: Vec<&str> = state
+            .visible_threads()
+            .into_iter()
+            .map(|t| t.id.0.as_str())
+            .collect();
+        assert_eq!(visible, vec!["t-2", "t-3"]);
+
+        // Stepping navigates only within visible results.
+        state.handle(InboxEvent::SelectNextThread);
+        assert_eq!(state.selected_thread, Some(ThreadId("t-3".into())));
+
+        // Clearing filters restores all threads.
+        state.handle(InboxEvent::ClearFilters);
+        assert_eq!(state.visible_threads().len(), 3);
     }
 }

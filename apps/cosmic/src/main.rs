@@ -9,6 +9,7 @@
 
 mod sample;
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use cosmic::app::{Core, Settings, Task};
@@ -21,7 +22,7 @@ use vela_core::{
     EmailAddress, Mailbox, MailboxId, MailboxRole, Message as MailMessage, MessageId,
     RemoteImagePolicy, ThreadId, ThreadSummary,
 };
-use vela_flows::{InboxEffect, InboxEvent, InboxState, TriageAction, html};
+use vela_flows::{InboxEffect, InboxEvent, InboxState, ThreadFilter, TriageAction, html};
 use vela_jmap::{JmapConfig, JmapCredentials, JmapSession, ThreadMutation, store};
 use zeroize::Zeroize;
 
@@ -159,6 +160,10 @@ enum Message {
     TriageFinished(Result<(), String>),
     AllowRemoteImages(MessageId),
     ToggleQuote(MessageId),
+    FocusSearch,
+    SearchChanged(String),
+    SetFilter(ThreadFilter),
+    ClearFilters,
 }
 
 impl App {
@@ -428,12 +433,14 @@ impl cosmic::Application for App {
                 keyboard::Key::Named(
                     keyboard::key::Named::Delete | keyboard::key::Named::Backspace,
                 ) => Some(Message::Trash),
+                keyboard::Key::Named(keyboard::key::Named::Escape) => Some(Message::ClearFilters),
                 keyboard::Key::Character(ref c) => match c.as_str() {
                     "j" => Some(Message::SelectNext),
                     "k" => Some(Message::SelectPrev),
                     "e" => Some(Message::Archive),
                     "u" => Some(Message::ToggleRead),
                     "z" => Some(Message::Undo),
+                    "/" => Some(Message::FocusSearch),
                     _ => None,
                 },
                 _ => None,
@@ -686,6 +693,20 @@ impl cosmic::Application for App {
             Message::TriageFinished(Err(err)) => self.dispatch(InboxEvent::ReportError(err)),
             Message::AllowRemoteImages(id) => self.dispatch(InboxEvent::AllowRemoteImages(id)),
             Message::ToggleQuote(id) => self.dispatch(InboxEvent::ToggleQuote(id)),
+            Message::FocusSearch => widget::text_input::focus(search_input_id()),
+            Message::SearchChanged(query) => {
+                let fts_matches = if query.trim().is_empty() {
+                    None
+                } else {
+                    self.cache
+                        .as_ref()
+                        .and_then(|c| c.search_threads(&query, 100).ok())
+                        .map(|hits| hits.into_iter().collect::<HashSet<_>>())
+                };
+                self.dispatch(InboxEvent::SetSearchQuery { query, fts_matches })
+            }
+            Message::SetFilter(filter) => self.dispatch(InboxEvent::SetFilter(filter)),
+            Message::ClearFilters => self.dispatch(InboxEvent::ClearFilters),
         }
     }
 
@@ -873,33 +894,60 @@ impl App {
         let header_title = active_mailbox
             .map(|mb| mb.name.as_str())
             .unwrap_or("Messages");
-        let header_meta = match active_mailbox {
-            Some(mb) if mb.unread_threads > 0 => format!("{} unread", mb.unread_threads),
-            Some(_) => format!("{}", self.inbox.threads.len()),
-            None => String::new(),
+        let unread_count = self.inbox.threads.iter().filter(|t| t.unread).count();
+        let unread_label = if unread_count > 0 {
+            format!("Unread ({unread_count})")
+        } else {
+            "Unread".to_string()
         };
+
+        let filter_row = widget::row::with_capacity(2)
+            .spacing(4)
+            .align_y(Alignment::Center)
+            .push(
+                widget::button::custom(widget::text::caption("All"))
+                    .class(cosmic::theme::Button::ListItem([6.0; 4]))
+                    .selected(self.inbox.filter == ThreadFilter::All)
+                    .padding([4, 10])
+                    .on_press(Message::SetFilter(ThreadFilter::All)),
+            )
+            .push(
+                widget::button::custom(widget::text::caption(unread_label))
+                    .class(cosmic::theme::Button::ListItem([6.0; 4]))
+                    .selected(self.inbox.filter == ThreadFilter::Unread)
+                    .padding([4, 10])
+                    .on_press(Message::SetFilter(ThreadFilter::Unread)),
+            );
 
         let header = widget::container(
             widget::row::with_capacity(3)
                 .push(widget::text::title4(header_title))
                 .push(widget::space::horizontal())
-                .push(
-                    widget::text::caption(header_meta)
-                        .class(cosmic::theme::Text::Custom(muted_text_style)),
-                )
+                .push(filter_row)
                 .align_y(Alignment::Center),
         )
-        .padding([0, 16])
+        .padding([0, 14])
         .align_y(Alignment::Center)
         .height(Length::Fixed(52.0))
         .width(Length::Fill);
 
-        let now = Zoned::now();
-        let mut list = widget::column::with_capacity(self.inbox.threads.len() + 1)
-            .spacing(4)
-            .padding([8, 10]);
+        let search_bar = widget::container(
+            widget::search_input("Search mail…  (/)", &self.inbox.search_query)
+                .id(search_input_id())
+                .on_input(Message::SearchChanged)
+                .on_clear(Message::ClearFilters)
+                .width(Length::Fill),
+        )
+        .padding([8, 12, 4, 12])
+        .width(Length::Fill);
 
-        if self.inbox.loading_threads {
+        let now = Zoned::now();
+        let visible_threads = self.inbox.visible_threads();
+        let mut list = widget::column::with_capacity(visible_threads.len() * 2 + 1)
+            .spacing(4)
+            .padding([6, 10]);
+
+        if self.inbox.loading_threads && self.inbox.threads.is_empty() {
             list = list.push(
                 widget::container(
                     widget::text::body("Loading conversations…")
@@ -915,13 +963,34 @@ impl App {
                 )
                 .padding(12),
             );
+        } else if visible_threads.is_empty() {
+            let empty_msg = if !self.inbox.search_query.trim().is_empty() {
+                format!("No matches for «{}».", self.inbox.search_query.trim())
+            } else {
+                "No unread conversations.".to_string()
+            };
+            list = list.push(
+                widget::container(
+                    widget::column::with_capacity(2)
+                        .spacing(10)
+                        .align_x(Alignment::Center)
+                        .push(
+                            widget::text::body(empty_msg)
+                                .class(cosmic::theme::Text::Custom(muted_text_style)),
+                        )
+                        .push(
+                            widget::button::standard("Clear filters")
+                                .on_press(Message::ClearFilters),
+                        ),
+                )
+                .padding([24, 12])
+                .center_x(Length::Fill),
+            );
         } else {
-            let thread_count = self.inbox.threads.len();
-            for (idx, thread) in self.inbox.threads.iter().enumerate() {
+            let thread_count = visible_threads.len();
+            for (idx, thread) in visible_threads.iter().enumerate() {
                 let selected = self.inbox.selected_thread.as_ref() == Some(&thread.id);
-                let next_selected = self
-                    .inbox
-                    .threads
+                let next_selected = visible_threads
                     .get(idx + 1)
                     .is_some_and(|next| self.inbox.selected_thread.as_ref() == Some(&next.id));
                 let sender = thread
@@ -1020,9 +1089,10 @@ impl App {
             }
         }
 
-        widget::column::with_capacity(3)
+        widget::column::with_capacity(4)
             .push(header)
             .push(widget::divider::horizontal::default())
+            .push(search_bar)
             .push(widget::scrollable(list).height(Length::Fill))
             .width(Length::Fixed(370.0))
             .height(Length::Fill)
@@ -1368,6 +1438,10 @@ impl App {
             .height(Length::Fill)
             .into()
     }
+}
+
+fn search_input_id() -> widget::Id {
+    widget::Id::new("vela-thread-search")
 }
 
 fn mailbox_icon_name(role: MailboxRole) -> &'static str {
