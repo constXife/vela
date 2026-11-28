@@ -308,12 +308,14 @@ fn tokenize(raw: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use jiff::tz::{self, TimeZone};
     use vela_core::{EmailAddress, MailboxId};
 
     use super::*;
 
+    // Fixed offsets keep tests hermetic: no system tzdb (absent in the Nix sandbox).
     fn now() -> Zoned {
-        "2026-11-28T12:00:00+00:00[UTC]".parse().unwrap()
+        ts("2026-11-28T12:00:00Z").to_zoned(TimeZone::UTC)
     }
 
     fn ts(s: &str) -> Timestamp {
@@ -358,7 +360,7 @@ mod tests {
 
     #[test]
     fn resolves_date_bounds_in_local_time_zone() {
-        let now: Zoned = "2026-11-28T12:00:00+03:00[Europe/Moscow]".parse().unwrap();
+        let now = ts("2026-11-28T09:00:00Z").to_zoned(TimeZone::fixed(tz::offset(3)));
         let q = SearchQuery::parse("after:2026-11-01 before:2026-11-15", &now);
         assert_eq!(q.received_after, Some(ts("2026-10-31T21:00:00Z")));
         assert_eq!(q.received_before, Some(ts("2026-11-14T21:00:00Z")));
