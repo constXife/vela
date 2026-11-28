@@ -89,6 +89,68 @@ impl EmailAddress {
     }
 }
 
+/// A correspondent seen in cached threads, with how many threads they appear
+/// in as a sender (`From`) or recipient (`To`/`Cc`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KnownAddress {
+    pub address: EmailAddress,
+    pub as_sender: u32,
+    pub as_recipient: u32,
+}
+
+impl KnownAddress {
+    /// Count correspondents across `(senders, recipients)` of distinct
+    /// threads. Addresses match case-insensitively; the first non-empty
+    /// display name wins. Sorted by total thread count, then address.
+    pub fn tally<'a>(
+        threads: impl IntoIterator<Item = (&'a [EmailAddress], &'a [EmailAddress])>,
+    ) -> Vec<Self> {
+        let mut book: std::collections::HashMap<String, Self> = std::collections::HashMap::new();
+        let mut add = |addr: &EmailAddress, sender: bool| {
+            let key = addr.email.trim().to_lowercase();
+            if key.is_empty() {
+                return;
+            }
+            let entry = book.entry(key).or_insert_with(|| Self {
+                address: EmailAddress {
+                    name: None,
+                    email: addr.email.trim().to_string(),
+                },
+                as_sender: 0,
+                as_recipient: 0,
+            });
+            if entry.address.name.is_none() {
+                entry.address.name = addr
+                    .name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|n| !n.is_empty())
+                    .map(str::to_string);
+            }
+            if sender {
+                entry.as_sender += 1;
+            } else {
+                entry.as_recipient += 1;
+            }
+        };
+        for (senders, recipients) in threads {
+            for addr in senders {
+                add(addr, true);
+            }
+            for addr in recipients {
+                add(addr, false);
+            }
+        }
+        let mut out: Vec<Self> = book.into_values().collect();
+        out.sort_by(|a, b| {
+            (b.as_sender + b.as_recipient)
+                .cmp(&(a.as_sender + a.as_recipient))
+                .then_with(|| a.address.email.cmp(&b.address.email))
+        });
+        out
+    }
+}
+
 /// Compact representation used in the center thread list.
 ///
 /// Built from the thread's latest email (JMAP `collapseThreads`), so `senders`
@@ -153,4 +215,54 @@ pub enum VelaError {
     MissingRole(MailboxRole),
     #[error("{0}")]
     Other(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn addr(name: Option<&str>, email: &str) -> EmailAddress {
+        EmailAddress {
+            name: name.map(str::to_string),
+            email: email.into(),
+        }
+    }
+
+    #[test]
+    fn tally_counts_roles_case_insensitively_and_ranks_by_total() {
+        let t1 = (
+            vec![addr(None, "Alice@Example.com")],
+            vec![addr(Some("Me"), "me@x.test")],
+        );
+        let t2 = (
+            vec![addr(Some("Alice Smith"), "alice@example.com")],
+            vec![addr(None, "me@x.test"), addr(Some(" "), "bob@y.test")],
+        );
+        let t3 = (vec![addr(None, "me@x.test")], vec![addr(None, "  ")]);
+        let book = KnownAddress::tally([
+            (t1.0.as_slice(), t1.1.as_slice()),
+            (t2.0.as_slice(), t2.1.as_slice()),
+            (t3.0.as_slice(), t3.1.as_slice()),
+        ]);
+
+        let summary: Vec<(&str, Option<&str>, u32, u32)> = book
+            .iter()
+            .map(|k| {
+                (
+                    k.address.email.as_str(),
+                    k.address.name.as_deref(),
+                    k.as_sender,
+                    k.as_recipient,
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                ("me@x.test", Some("Me"), 1, 2),
+                ("Alice@Example.com", Some("Alice Smith"), 2, 0),
+                ("bob@y.test", None, 0, 1),
+            ]
+        );
+    }
 }

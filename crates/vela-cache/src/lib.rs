@@ -14,8 +14,8 @@ use std::sync::Mutex;
 use jiff::Timestamp;
 use rusqlite::{Connection, OptionalExtension, params};
 use vela_core::{
-    Attachment, EmailAddress, Mailbox, MailboxId, MailboxRole, Message, MessageId, ThreadId,
-    ThreadSummary, VelaError,
+    Attachment, EmailAddress, KnownAddress, Mailbox, MailboxId, MailboxRole, Message, MessageId,
+    ThreadId, ThreadSummary, VelaError,
 };
 use zeroize::Zeroizing;
 
@@ -333,6 +333,34 @@ impl VelaCache {
             });
         }
         Ok(out)
+    }
+
+    /// Correspondents across all cached threads (each thread counted once,
+    /// even when it is listed in several mailboxes).
+    pub fn known_addresses(&self) -> Result<Vec<KnownAddress>, VelaError> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT senders_json, recipients_json FROM threads
+                 WHERE rowid IN (SELECT min(rowid) FROM threads GROUP BY id)",
+            )
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(db_err)?;
+        let mut threads: Vec<(Vec<EmailAddress>, Vec<EmailAddress>)> = Vec::new();
+        for row in rows {
+            let (senders_json, recipients_json) = row.map_err(db_err)?;
+            threads.push((
+                serde_json::from_str(&senders_json).map_err(json_err)?,
+                serde_json::from_str(&recipients_json).map_err(json_err)?,
+            ));
+        }
+        Ok(KnownAddress::tally(
+            threads.iter().map(|(s, r)| (s.as_slice(), r.as_slice())),
+        ))
     }
 
     /// Persist all messages for a conversation thread and refresh its FTS5 entry.
@@ -963,6 +991,54 @@ mod tests {
             vec![ThreadId("t-1".into())]
         );
         assert!(cache.search_threads(&[" ", ""], 10).unwrap().is_empty());
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn known_addresses_count_each_thread_once() {
+        let path = temp_db_path("known_addresses");
+        let cache = VelaCache::open_at(path.clone(), KEY_A).unwrap();
+        let thread = |id: &str, mailbox: &str| ThreadSummary {
+            id: ThreadId(id.into()),
+            subject: String::new(),
+            snippet: String::new(),
+            senders: vec![EmailAddress {
+                name: Some("Alice".into()),
+                email: "alice@example.com".into(),
+            }],
+            recipients: vec![EmailAddress {
+                name: None,
+                email: "me@example.com".into(),
+            }],
+            received_at: Timestamp::UNIX_EPOCH,
+            message_count: 1,
+            unread: false,
+            flagged: false,
+            has_attachments: false,
+            mailbox_ids: vec![MailboxId(mailbox.into())],
+        };
+        let inbox = MailboxId("inbox".into());
+        let archive = MailboxId("archive".into());
+        cache
+            .save_threads(&inbox, &[thread("t-1", "inbox"), thread("t-2", "inbox")])
+            .unwrap();
+        // t-1 is also listed under Archive (multi-mailbox labels).
+        cache
+            .save_threads(&archive, &[thread("t-1", "archive")])
+            .unwrap();
+
+        let book = cache.known_addresses().unwrap();
+        let alice = book
+            .iter()
+            .find(|k| k.address.email == "alice@example.com")
+            .unwrap();
+        assert_eq!((alice.as_sender, alice.as_recipient), (2, 0));
+        let me = book
+            .iter()
+            .find(|k| k.address.email == "me@example.com")
+            .unwrap();
+        assert_eq!((me.as_sender, me.as_recipient), (0, 2));
 
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
