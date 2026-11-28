@@ -19,7 +19,9 @@ use vela_core::{
 };
 use zeroize::Zeroizing;
 
-const SCHEMA_VERSION: &str = "1";
+/// Bump on any schema change: a cache with another version is dropped and
+/// rebuilt from the server (it holds no data the server does not have).
+const SCHEMA_VERSION: &str = "2";
 
 /// Thread-safe handle to the local SQLCipher cache database.
 pub struct VelaCache {
@@ -201,9 +203,9 @@ impl VelaCache {
             let mut insert_thread = tx
                 .prepare(
                     "INSERT OR REPLACE INTO threads
-                     (id, mailbox_id, position, subject, snippet, senders_json, received_at,
-                      message_count, unread, flagged, has_attachments, mailbox_ids_json)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                     (id, mailbox_id, position, subject, snippet, senders_json, recipients_json,
+                      received_at, message_count, unread, flagged, has_attachments, mailbox_ids_json)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 )
                 .map_err(db_err)?;
             let mut delete_fts = tx
@@ -218,6 +220,8 @@ impl VelaCache {
 
             for (pos, thread) in threads.iter().enumerate() {
                 let senders_json = serde_json::to_string(&thread.senders).map_err(json_err)?;
+                let recipients_json =
+                    serde_json::to_string(&thread.recipients).map_err(json_err)?;
                 let mailbox_ids_json =
                     serde_json::to_string(&thread.mailbox_ids).map_err(json_err)?;
                 insert_thread
@@ -228,6 +232,7 @@ impl VelaCache {
                         thread.subject,
                         thread.snippet,
                         senders_json,
+                        recipients_json,
                         thread.received_at.as_second(),
                         thread.message_count,
                         i64::from(thread.unread),
@@ -264,8 +269,8 @@ impl VelaCache {
         let conn = self.lock_conn()?;
         let mut stmt = conn
             .prepare(
-                "SELECT id, subject, snippet, senders_json, received_at, message_count,
-                        unread, flagged, has_attachments, mailbox_ids_json
+                "SELECT id, subject, snippet, senders_json, recipients_json, received_at,
+                        message_count, unread, flagged, has_attachments, mailbox_ids_json
                  FROM threads
                  WHERE mailbox_id = ?1
                  ORDER BY position ASC",
@@ -274,20 +279,18 @@ impl VelaCache {
 
         let rows = stmt
             .query_map(params![mailbox_id.0], |row| {
-                let senders_json: String = row.get(3)?;
-                let received_secs: i64 = row.get(4)?;
-                let mailbox_ids_json: String = row.get(9)?;
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
-                    senders_json,
-                    received_secs,
-                    row.get::<_, u32>(5)?,
-                    row.get::<_, i64>(6)? != 0,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, u32>(6)?,
                     row.get::<_, i64>(7)? != 0,
                     row.get::<_, i64>(8)? != 0,
-                    mailbox_ids_json,
+                    row.get::<_, i64>(9)? != 0,
+                    row.get::<_, String>(10)?,
                 ))
             })
             .map_err(db_err)?;
@@ -299,6 +302,7 @@ impl VelaCache {
                 subject,
                 snippet,
                 senders_json,
+                recipients_json,
                 received_secs,
                 message_count,
                 unread,
@@ -308,6 +312,8 @@ impl VelaCache {
             ) = row.map_err(db_err)?;
             let senders: Vec<EmailAddress> =
                 serde_json::from_str(&senders_json).map_err(json_err)?;
+            let recipients: Vec<EmailAddress> =
+                serde_json::from_str(&recipients_json).map_err(json_err)?;
             let mailbox_ids: Vec<MailboxId> =
                 serde_json::from_str(&mailbox_ids_json).map_err(json_err)?;
             let received_at =
@@ -317,6 +323,7 @@ impl VelaCache {
                 subject,
                 snippet,
                 senders,
+                recipients,
                 received_at,
                 message_count,
                 unread,
@@ -615,6 +622,7 @@ fn open_and_verify(path: &Path, hex_key: &str) -> Result<Connection, VelaError> 
 }
 
 fn init_schema(conn: &Connection) -> Result<(), VelaError> {
+    drop_outdated_schema(conn)?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS meta (
              key   TEXT PRIMARY KEY,
@@ -636,6 +644,7 @@ fn init_schema(conn: &Connection) -> Result<(), VelaError> {
              subject          TEXT NOT NULL,
              snippet          TEXT NOT NULL,
              senders_json     TEXT NOT NULL,
+             recipients_json  TEXT NOT NULL,
              received_at      INTEGER NOT NULL,
              message_count    INTEGER NOT NULL,
              unread           INTEGER NOT NULL,
@@ -679,6 +688,45 @@ fn init_schema(conn: &Connection) -> Result<(), VelaError> {
     )
     .map_err(db_err)?;
     Ok(())
+}
+
+/// Drop every table (including sync state tokens) when the stored schema
+/// version differs, so the next sync refetches everything from the server.
+fn drop_outdated_schema(conn: &Connection) -> Result<(), VelaError> {
+    let has_meta: bool = conn
+        .query_row(
+            "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(db_err)?;
+    if !has_meta {
+        return Ok(());
+    }
+    let version: Option<String> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'schema_version'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(db_err)?;
+    if version.as_deref() == Some(SCHEMA_VERSION) {
+        return Ok(());
+    }
+    tracing::info!(
+        from = version.as_deref().unwrap_or("none"),
+        to = SCHEMA_VERSION,
+        "cache schema changed; rebuilding local cache"
+    );
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS messages_fts;
+         DROP TABLE IF EXISTS messages;
+         DROP TABLE IF EXISTS threads;
+         DROP TABLE IF EXISTS mailboxes;
+         DROP TABLE IF EXISTS meta;",
+    )
+    .map_err(db_err)
 }
 
 fn ensure_parent_dir(path: &Path) -> Result<(), VelaError> {
@@ -777,6 +825,10 @@ mod tests {
                 name: Some("Billing".into()),
                 email: "billing@example.com".into(),
             }],
+            recipients: vec![EmailAddress {
+                name: None,
+                email: "you@example.com".into(),
+            }],
             received_at: Timestamp::from_second(1_700_000_000).unwrap(),
             message_count: 1,
             unread: true,
@@ -830,6 +882,30 @@ mod tests {
             !raw_bytes.windows(needle.len()).any(|w| w == needle),
             "plaintext secret leaked into SQLCipher database file!"
         );
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn outdated_schema_version_is_dropped_and_rebuilt() {
+        let path = temp_db_path("schema_version");
+        {
+            let cache = VelaCache::open_at(path.clone(), KEY_A).unwrap();
+            cache.set_sync_state("email_state", "s-123").unwrap();
+            let conn = cache.lock_conn().unwrap();
+            conn.execute_batch(
+                "UPDATE meta SET value = '0' WHERE key = 'schema_version';
+                 ALTER TABLE threads DROP COLUMN recipients_json;",
+            )
+            .unwrap();
+        }
+
+        let rebuilt = VelaCache::open_at(path.clone(), KEY_A).unwrap();
+        // Sync tokens are dropped with the data so the next sync is a full refetch.
+        assert_eq!(rebuilt.get_sync_state("email_state").unwrap(), None);
+        let mailbox_id = MailboxId("mb".into());
+        rebuilt.save_threads(&mailbox_id, &[]).unwrap();
+        assert!(rebuilt.load_threads(&mailbox_id).unwrap().is_empty());
 
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }

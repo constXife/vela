@@ -79,6 +79,10 @@ pub fn threads_for_mailbox(mailbox_id: &MailboxId) -> Vec<ThreadSummary> {
                 name: Some("Vela Prototype".into()),
                 email: "vela@yogg.local".into(),
             }],
+            recipients: vec![EmailAddress {
+                name: Some("You".into()),
+                email: "you@yogg.local".into(),
+            }],
             received_at: minutes_ago(12),
             message_count: 2,
             unread: true,
@@ -94,6 +98,10 @@ pub fn threads_for_mailbox(mailbox_id: &MailboxId) -> Vec<ThreadSummary> {
                 name: Some("COSMIC Digest".into()),
                 email: "digest@example.org".into(),
             }],
+            recipients: vec![EmailAddress {
+                name: Some("You".into()),
+                email: "you@yogg.local".into(),
+            }],
             received_at: days_ago(1),
             message_count: 1,
             unread: true,
@@ -108,6 +116,10 @@ pub fn threads_for_mailbox(mailbox_id: &MailboxId) -> Vec<ThreadSummary> {
             senders: vec![EmailAddress {
                 name: Some("Postmaster".into()),
                 email: "postmaster@yogg.local".into(),
+            }],
+            recipients: vec![EmailAddress {
+                name: Some("You".into()),
+                email: "you@yogg.local".into(),
             }],
             received_at: days_ago(4),
             message_count: 1,

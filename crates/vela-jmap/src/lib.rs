@@ -263,6 +263,8 @@ impl JmapSession {
             EmailProperty::Subject,
             EmailProperty::Preview,
             EmailProperty::From,
+            EmailProperty::To,
+            EmailProperty::Cc,
             EmailProperty::ReceivedAt,
             EmailProperty::Keywords,
             EmailProperty::HasAttachment,
@@ -336,6 +338,10 @@ impl JmapSession {
                     .to_string(),
                 snippet: email.preview().unwrap_or_default().to_string(),
                 senders: map_addresses(email.from()),
+                recipients: map_addresses(email.to())
+                    .into_iter()
+                    .chain(map_addresses(email.cc()))
+                    .collect(),
                 received_at: map_timestamp(email.received_at()),
                 message_count,
                 unread,

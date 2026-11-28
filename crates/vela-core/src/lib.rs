@@ -90,12 +90,16 @@ impl EmailAddress {
 }
 
 /// Compact representation used in the center thread list.
+///
+/// Built from the thread's latest email (JMAP `collapseThreads`), so `senders`
+/// and `recipients` describe that email's `From` and `To` + `Cc`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ThreadSummary {
     pub id: ThreadId,
     pub subject: String,
     pub snippet: String,
     pub senders: Vec<EmailAddress>,
+    pub recipients: Vec<EmailAddress>,
     pub received_at: Timestamp,
     pub message_count: u32,
     pub unread: bool,

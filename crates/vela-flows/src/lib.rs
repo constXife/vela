@@ -769,6 +769,7 @@ mod tests {
                 name: Some("Alice".into()),
                 email: "alice@example.com".into(),
             }],
+            recipients: vec![],
             received_at: Timestamp::UNIX_EPOCH,
             message_count: 1,
             unread: true,
