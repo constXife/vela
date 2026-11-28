@@ -9,7 +9,8 @@
 #   --sample         Launch Vela in sample mode (default)
 #   --live           Launch Vela with the saved JMAP account
 #   --click X,Y      Click at window/output coordinates via sway seat (repeatable)
-#   --keys KEYS      Comma-separated keys to send via wtype (e.g. "j,e")
+#   --keys KEYS      Comma-separated text to type via wtype (e.g. "j,e");
+#                    "@Name" presses a named key (e.g. "@Down,@Return")
 #   --size WxH       Headless output resolution (default: 1280x760)
 #   --wait SECS      Extra settle delay before capture (default: 1.0)
 
@@ -127,7 +128,11 @@ if [[ -n "$KEYS" ]]; then
     sleep 0.2
     IFS=',' read -ra KEY_LIST <<< "$KEYS"
     for k in "\${KEY_LIST[@]}"; do
-        wtype -s 200 -d 100 "\$k"
+        if [[ "\$k" == @* ]]; then
+            wtype -s 200 -k "\${k#@}"
+        else
+            wtype -s 200 -d 100 "\$k"
+        fi
         sleep 0.4
     done
     sleep 0.3
