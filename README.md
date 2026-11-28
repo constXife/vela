@@ -32,11 +32,33 @@ nix run github:constXife/vela
 nix run github:constXife/vela -- --sample
 
 # Install Vela (vela-cosmic + vela-mcp + desktop entry + icon) into your profile
-nix profile install github:constXife/vela
+nix profile add github:constXife/vela
 
 # Run the headless MCP server
 nix run github:constXife/vela#vela-mcp
 ```
+
+Declaratively in a flake-based NixOS or Home Manager config (`x86_64-linux` and `aarch64-linux`):
+
+```nix
+{
+  inputs.vela.url = "github:constXife/vela";
+
+  outputs = { nixpkgs, vela, ... }: {
+    nixosConfigurations.my-host = nixpkgs.lib.nixosSystem {
+      modules = [
+        ./configuration.nix
+        ({ pkgs, ... }: {
+          nixpkgs.overlays = [ vela.overlays.default ];
+          environment.systemPackages = [ pkgs.vela ]; # or home.packages
+        })
+      ];
+    };
+  };
+}
+```
+
+The overlay exposes this flake's pinned build as `pkgs.vela`, so it does not depend on your nixpkgs revision or Rust toolchain.
 
 ### Build from Source
 
