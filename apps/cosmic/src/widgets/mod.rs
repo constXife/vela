@@ -4,4 +4,4 @@
 
 mod token_input;
 
-pub use token_input::{Token, token_input};
+pub use token_input::{SuggestionItem, Token, token_input};

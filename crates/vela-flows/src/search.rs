@@ -23,12 +23,54 @@
 
 use std::collections::HashSet;
 
-use jiff::civil::Date;
+use jiff::civil::{Date, Weekday};
 use jiff::{Span, Timestamp, Zoned};
-use vela_core::{EmailAddress, ThreadId, ThreadSummary};
+use vela_core::{EmailAddress, KnownAddress, ThreadId, ThreadSummary};
 
 /// Operator keys; any other `key:value` token is free text.
 const OPERATOR_KEYS: [&str; 7] = ["from", "to", "has", "is", "after", "before", "newer"];
+
+const MAX_SUGGESTIONS: usize = 8;
+
+/// Operator templates offered while typing a bare word.
+const OPERATOR_TEMPLATES: [(&str, &str); 9] = [
+    ("from:", "Sender name or address"),
+    ("to:", "Recipient name or address"),
+    ("has:attachment", "With attachments"),
+    ("is:unread", "Unread"),
+    ("is:read", "Read"),
+    ("is:flagged", "Flagged"),
+    ("after:", "Received on or after YYYY-MM-DD"),
+    ("before:", "Received before YYYY-MM-DD"),
+    ("newer:", "Received within 7d, 2w, 3m, 1y"),
+];
+
+/// A completion for the token being typed in the search draft.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Suggestion {
+    pub label: String,
+    pub detail: Option<String>,
+    /// Token that replaces the one being typed.
+    pub replacement: String,
+}
+
+impl Suggestion {
+    fn new(
+        label: impl Into<String>,
+        detail: Option<String>,
+        replacement: impl Into<String>,
+    ) -> Self {
+        Self {
+            label: label.into(),
+            detail,
+            replacement: replacement.into(),
+        }
+    }
+
+    fn operator(token: String, detail: &str) -> Self {
+        Self::new(token.clone(), Some(detail.to_string()), token)
+    }
+}
 
 /// Search bar contents: committed operator blocks and the draft being typed.
 ///
@@ -148,6 +190,82 @@ impl SearchInput {
                     k.eq_ignore_ascii_case(key) && unquote(v).eq_ignore_ascii_case(value)
                 })
             })
+    }
+
+    /// Completions for the token being typed at the end of the draft:
+    /// operator keys for a bare word (2+ characters), fixed values for
+    /// `is:`/`has:`/`newer:`/`after:`/`before:`, and correspondents from
+    /// `book` for `from:`/`to:`.
+    pub fn suggestions(&self, book: &[KnownAddress], now: &Zoned) -> Vec<Suggestion> {
+        let Some(token) = self.current_token() else {
+            return Vec::new();
+        };
+        let Some((key, value)) = split_operator(&token).filter(|_| is_operator_token(&token))
+        else {
+            if token.chars().count() < 2 {
+                return Vec::new();
+            }
+            let prefix = token.to_lowercase();
+            return OPERATOR_TEMPLATES
+                .iter()
+                .filter(|(template, _)| template.starts_with(&prefix) && *template != prefix)
+                .map(|(template, detail)| Suggestion::operator(template.to_string(), detail))
+                .collect();
+        };
+        let key = key.to_ascii_lowercase();
+        let value = unquote(value).to_lowercase();
+        let fixed = |options: &[(String, &str)]| -> Vec<Suggestion> {
+            options
+                .iter()
+                .filter(|(option, _)| option.starts_with(&value))
+                .map(|(option, detail)| Suggestion::operator(format!("{key}:{option}"), detail))
+                .collect()
+        };
+        match key.as_str() {
+            "from" => address_suggestions(&key, &value, book, |k| k.as_sender),
+            "to" => address_suggestions(&key, &value, book, |k| k.as_recipient),
+            "is" => fixed(&[
+                ("unread".into(), "Unread"),
+                ("read".into(), "Read"),
+                ("flagged".into(), "Flagged"),
+            ]),
+            "has" => fixed(&[("attachment".into(), "With attachments")]),
+            "newer" => fixed(&[
+                ("1d".into(), "Last day"),
+                ("7d".into(), "Last 7 days"),
+                ("30d".into(), "Last 30 days"),
+                ("1y".into(), "Last year"),
+            ]),
+            "after" | "before" => fixed(&date_presets(now)),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Replace the token being typed with `suggestion`. A complete operator
+    /// becomes a block; a bare key (`from:`) stays in the draft for its value.
+    pub fn accepting(&self, suggestion: &Suggestion) -> Self {
+        let mut tokens = tokenize(&self.draft);
+        if self.current_token().is_some() {
+            tokens.pop();
+        }
+        tokens.push(suggestion.replacement.clone());
+        let draft = join_draft(&tokens, false);
+        if suggestion.replacement.ends_with(':') {
+            Self {
+                blocks: self.blocks.clone(),
+                draft,
+            }
+        } else {
+            self.with_draft(&format!("{draft} "))
+        }
+    }
+
+    /// The token at the end of the draft while it is still being typed.
+    fn current_token(&self) -> Option<String> {
+        if self.draft.ends_with(char::is_whitespace) && quotes_balanced(&self.draft) {
+            return None;
+        }
+        tokenize(&self.draft).pop()
     }
 
     /// Toggle `key:value`: if present, every `key:*` block and draft token is
@@ -396,6 +514,56 @@ fn relative_age_start(value: &str, now: &Zoned) -> Option<Timestamp> {
     now.checked_sub(span).ok().map(|z| z.timestamp())
 }
 
+fn address_suggestions(
+    key: &str,
+    needle: &str,
+    book: &[KnownAddress],
+    role_count: impl Fn(&KnownAddress) -> u32,
+) -> Vec<Suggestion> {
+    let mut matches: Vec<&KnownAddress> = book
+        .iter()
+        .filter(|known| {
+            known.address.email.to_lowercase().contains(needle)
+                || known
+                    .address
+                    .name
+                    .as_deref()
+                    .is_some_and(|name| name.to_lowercase().contains(needle))
+        })
+        .collect();
+    // `book` is already ranked by total; prefer the role this operator asks for.
+    matches.sort_by_key(|known| std::cmp::Reverse(role_count(known)));
+    matches
+        .into_iter()
+        .take(MAX_SUGGESTIONS)
+        .map(|known| {
+            let email = &known.address.email;
+            let (label, detail) = match &known.address.name {
+                Some(name) => (name.clone(), Some(email.clone())),
+                None => (email.clone(), None),
+            };
+            Suggestion::new(label, detail, format!("{key}:{email}"))
+        })
+        .collect()
+}
+
+fn date_presets(now: &Zoned) -> Vec<(String, &'static str)> {
+    let today = now.date();
+    let week_start = today
+        .nth_weekday(-1, Weekday::Monday)
+        .ok()
+        .filter(|_| today.weekday() != Weekday::Monday)
+        .unwrap_or(today);
+    let month_start = today.first_of_month();
+    let year_start = today.first_of_year();
+    vec![
+        (today.to_string(), "Today"),
+        (week_start.to_string(), "This week"),
+        (month_start.to_string(), "This month"),
+        (year_start.to_string(), "This year"),
+    ]
+}
+
 fn is_operator_token(token: &str) -> bool {
     split_operator(token).is_some_and(|(key, _)| {
         OPERATOR_KEYS
@@ -640,5 +808,102 @@ mod tests {
         let off = seven.toggled_operator("newer", "7d");
         assert!(off.blocks().is_empty());
         assert_eq!(off.raw(), "invoice");
+    }
+
+    fn book() -> Vec<KnownAddress> {
+        let known = |name: Option<&str>, email: &str, as_sender, as_recipient| KnownAddress {
+            address: EmailAddress {
+                name: name.map(str::to_string),
+                email: email.into(),
+            },
+            as_sender,
+            as_recipient,
+        };
+        vec![
+            known(Some("Me"), "me@corp.test", 1, 9),
+            known(Some("Alice Smith"), "alice@example.com", 5, 0),
+            known(None, "alerts@monitor.test", 2, 0),
+        ]
+    }
+
+    fn labels(input: &SearchInput) -> Vec<String> {
+        input
+            .suggestions(&book(), &now())
+            .into_iter()
+            .map(|s| s.label)
+            .collect()
+    }
+
+    #[test]
+    fn suggests_operators_for_bare_words() {
+        let input = SearchInput::default().with_draft("invoice is");
+        assert_eq!(labels(&input), vec!["is:unread", "is:read", "is:flagged"]);
+        // One character, finished words and unknown prefixes suggest nothing.
+        assert!(labels(&SearchInput::default().with_draft("i")).is_empty());
+        assert!(labels(&SearchInput::default().with_draft("is ")).is_empty());
+        assert!(labels(&SearchInput::default().with_draft("invoice")).is_empty());
+    }
+
+    #[test]
+    fn suggests_operator_values() {
+        let input = SearchInput::default().with_draft("newer:");
+        assert_eq!(
+            labels(&input),
+            vec!["newer:1d", "newer:7d", "newer:30d", "newer:1y"]
+        );
+        let input = SearchInput::default().with_draft("is:un");
+        assert_eq!(labels(&input), vec!["is:unread"]);
+        // now() is Saturday 2026-11-28.
+        let input = SearchInput::default().with_draft("after:");
+        assert_eq!(
+            labels(&input),
+            vec![
+                "after:2026-11-28",
+                "after:2026-11-23",
+                "after:2026-11-01",
+                "after:2026-01-01"
+            ]
+        );
+    }
+
+    #[test]
+    fn suggests_addresses_ranked_by_role() {
+        let suggestions = SearchInput::default()
+            .with_draft("from:")
+            .suggestions(&book(), &now());
+        let replacements: Vec<&str> = suggestions.iter().map(|s| s.replacement.as_str()).collect();
+        assert_eq!(
+            replacements,
+            vec![
+                "from:alice@example.com",
+                "from:alerts@monitor.test",
+                "from:me@corp.test"
+            ]
+        );
+        assert_eq!(suggestions[0].label, "Alice Smith");
+        assert_eq!(suggestions[0].detail.as_deref(), Some("alice@example.com"));
+
+        // Matches names and addresses; `to:` prefers recipients.
+        let input = SearchInput::default().with_draft("to:AL");
+        assert_eq!(labels(&input), vec!["Alice Smith", "alerts@monitor.test"]);
+        let input = SearchInput::default().with_draft("to:");
+        assert_eq!(labels(&input)[0], "Me");
+    }
+
+    #[test]
+    fn accepting_replaces_the_current_token() {
+        let input = SearchInput::default().with_draft("invoice fr");
+        let from = &input.suggestions(&book(), &now())[0];
+        // A bare key stays in the draft so the value can be typed next.
+        let input = input.accepting(from);
+        assert_eq!(input.draft(), "invoice from:");
+        assert!(input.blocks().is_empty());
+
+        // A complete operator becomes a block.
+        let input = input.with_draft("invoice from:ali");
+        let alice = &input.suggestions(&book(), &now())[0];
+        let input = input.accepting(alice);
+        assert_eq!(input.blocks(), ["from:alice@example.com"]);
+        assert_eq!(input.draft(), "invoice ");
     }
 }

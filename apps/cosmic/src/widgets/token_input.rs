@@ -3,11 +3,13 @@
 //! Text input that shows committed values as removable token blocks inside the
 //! field (search operators today; recipients or labels later).
 //!
-//! The widget is stateless about its content: the caller owns the token list
-//! and the draft text and reacts to the callbacks. The wrapper only adds what a
-//! plain composition of libcosmic widgets cannot do: Backspace in an empty
-//! draft removes the last token, clicking empty space in the field focuses the
-//! input, and the whole field shows one focus ring.
+//! The widget is stateless about its content: the caller owns the token list,
+//! the draft text and the suggestion list (with its highlighted row) and
+//! reacts to the callbacks. The wrapper only adds what a plain composition of
+//! libcosmic widgets cannot do: Backspace in an empty draft removes the last
+//! token, Up/Down/Tab/Enter/Esc drive the suggestion popup, clicking empty
+//! space in the field focuses the input, and the whole field shows one focus
+//! ring.
 
 use cosmic::iced::Alignment;
 use cosmic::iced::core::Renderer as _;
@@ -28,6 +30,23 @@ pub struct Token {
     pub warning: bool,
 }
 
+/// One row of the suggestion popup.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SuggestionItem {
+    pub label: String,
+    pub detail: Option<String>,
+}
+
+/// Suggestion popup contents and callbacks.
+struct Suggestions<'a, Message> {
+    items: Vec<SuggestionItem>,
+    highlighted: Option<usize>,
+    width: f32,
+    on_accept: Box<dyn Fn(usize) -> Message + 'a>,
+    on_highlight: Box<dyn Fn(Option<usize>) -> Message + 'a>,
+    on_dismiss: Message,
+}
+
 /// Builder for a token input; convert it into an [`Element`] to render.
 pub struct TokenInput<'a, Message> {
     id: Id,
@@ -41,6 +60,7 @@ pub struct TokenInput<'a, Message> {
     on_remove_token: Option<Box<dyn Fn(usize) -> Message + 'a>>,
     on_remove_last: Option<Message>,
     on_clear: Option<Message>,
+    suggestions: Option<Suggestions<'a, Message>>,
 }
 
 /// A token input whose inner text field uses `id` (for focusing it).
@@ -62,6 +82,7 @@ pub fn token_input<'a, Message>(
         on_remove_token: None,
         on_remove_last: None,
         on_clear: None,
+        suggestions: None,
     }
 }
 
@@ -102,6 +123,30 @@ impl<'a, Message> TokenInput<'a, Message> {
     /// Shows a clear button while there is any token or draft text.
     pub fn on_clear(mut self, message: Message) -> Self {
         self.on_clear = Some(message);
+        self
+    }
+
+    /// Show `items` in a popup of `width` below the field (none when empty).
+    /// Down/Up move `highlighted` through `on_highlight`; Tab accepts the
+    /// highlighted row (or the first), Enter only an explicitly highlighted
+    /// one, and Esc or a click outside calls `on_dismiss`.
+    pub fn suggestions(
+        mut self,
+        items: Vec<SuggestionItem>,
+        highlighted: Option<usize>,
+        width: f32,
+        on_accept: impl Fn(usize) -> Message + 'a,
+        on_highlight: impl Fn(Option<usize>) -> Message + 'a,
+        on_dismiss: Message,
+    ) -> Self {
+        self.suggestions = Some(Suggestions {
+            items,
+            highlighted,
+            width,
+            on_accept: Box::new(on_accept),
+            on_highlight: Box::new(on_highlight),
+            on_dismiss,
+        });
         self
     }
 }
@@ -160,11 +205,24 @@ impl<'a, Message: Clone + 'static> From<TokenInput<'a, Message>> for Element<'a,
             );
         }
 
-        let frame = TokenFrame {
-            content: widget::container(row)
+        // The popover keeps the field as its first child whether or not the
+        // popup is shown, so toggling suggestions never resets the field.
+        let mut field = widget::popover(
+            widget::container(row)
                 .padding([4, 12, 4, 12])
-                .width(Length::Fill)
-                .into(),
+                .width(Length::Fill),
+        )
+        .position(widget::popover::Position::Bottom);
+        let suggestions = input.suggestions.filter(|s| !s.items.is_empty());
+        if let Some(s) = &suggestions {
+            field = field
+                .popup(suggestion_list(s))
+                .on_close(s.on_dismiss.clone());
+        }
+
+        let frame = TokenFrame {
+            content: field.into(),
+            suggestions,
             input_id: input.id,
             on_remove_last: if input.value.is_empty() {
                 input.on_remove_last
@@ -173,6 +231,48 @@ impl<'a, Message: Clone + 'static> From<TokenInput<'a, Message>> for Element<'a,
             },
         };
         Element::new(frame)
+    }
+}
+
+fn suggestion_list<'a, Message: Clone + 'static>(
+    suggestions: &Suggestions<'_, Message>,
+) -> Element<'a, Message> {
+    let mut list = widget::column::with_capacity(suggestions.items.len()).spacing(2);
+    for (index, item) in suggestions.items.iter().enumerate() {
+        let mut row = widget::row::with_capacity(3)
+            .spacing(12)
+            .align_y(Alignment::Center)
+            .push(widget::text::body(item.label.clone()));
+        if let Some(detail) = &item.detail {
+            row = row.push(widget::space::horizontal()).push(
+                widget::text::caption(detail.clone())
+                    .class(cosmic::theme::Text::Custom(muted_text)),
+            );
+        }
+        list = list.push(
+            widget::button::custom(row)
+                .class(cosmic::theme::Button::ListItem([6.0; 4]))
+                .selected(suggestions.highlighted == Some(index))
+                .padding([6, 10])
+                .width(Length::Fill)
+                .on_press((suggestions.on_accept)(index)),
+        );
+    }
+    widget::container(
+        widget::container(list)
+            .padding(4)
+            .width(Length::Fixed(suggestions.width))
+            .class(cosmic::theme::Container::Dropdown),
+    )
+    .padding([4, 0, 0, 0])
+    .into()
+}
+
+fn muted_text(theme: &Theme) -> cosmic::iced::widget::text::Style {
+    let color: Color = theme.cosmic().on_bg_color().into();
+    cosmic::iced::widget::text::Style {
+        color: Some(color.scale_alpha(0.6)),
+        ..Default::default()
     }
 }
 
@@ -248,6 +348,7 @@ fn transparent_input_style() -> cosmic::theme::TextInput {
 /// Wrapper that draws the field frame and handles focus-related input.
 struct TokenFrame<'a, Message> {
     content: Element<'a, Message>,
+    suggestions: Option<Suggestions<'a, Message>>,
     input_id: Id,
     on_remove_last: Option<Message>,
 }
@@ -264,6 +365,36 @@ impl<Message: Clone> TokenFrame<'_, Message> {
             .next()
             .expect("token frame has one child")
             .with_virtual_offset(layout.virtual_offset())
+    }
+
+    /// The message a named key produces while the text field is focused.
+    fn key_message(&self, key: keyboard::key::Named) -> Option<Message> {
+        use keyboard::key::Named;
+        if let Some(s) = &self.suggestions {
+            let last = s.items.len() - 1;
+            match key {
+                Named::ArrowDown => {
+                    let next = s.highlighted.map_or(0, |i| (i + 1).min(last));
+                    return Some((s.on_highlight)(Some(next)));
+                }
+                Named::ArrowUp => {
+                    let prev = s.highlighted.and_then(|i| i.checked_sub(1));
+                    return Some((s.on_highlight)(prev));
+                }
+                Named::Tab => return Some((s.on_accept)(s.highlighted.unwrap_or(0))),
+                Named::Enter => {
+                    if let Some(index) = s.highlighted {
+                        return Some((s.on_accept)(index));
+                    }
+                }
+                Named::Escape => return Some(s.on_dismiss.clone()),
+                _ => {}
+            }
+        }
+        match key {
+            Named::Backspace => self.on_remove_last.clone(),
+            _ => None,
+        }
     }
 
     fn input_focused(&mut self, tree: &mut Tree, layout: Layout<'_>, renderer: &Renderer) -> bool {
@@ -345,10 +476,10 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TokenFrame<'_, Message
         viewport: &Rectangle,
     ) {
         if let Event::Keyboard(keyboard::Event::KeyPressed {
-            key: keyboard::Key::Named(keyboard::key::Named::Backspace),
+            key: keyboard::Key::Named(named),
             ..
         }) = event
-            && let Some(message) = self.on_remove_last.clone()
+            && let Some(message) = self.key_message(*named)
             && self.input_focused(tree, layout, renderer)
         {
             shell.publish(message);

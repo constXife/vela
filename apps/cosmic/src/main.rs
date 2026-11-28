@@ -25,11 +25,12 @@ use cosmic::{ApplicationExt, Element, executor, widget};
 use jiff::{Timestamp, Zoned, tz::TimeZone};
 use vela_cache::VelaCache;
 use vela_core::{
-    Attachment, BlobId, EmailAddress, Mailbox, MailboxId, MailboxRole, Message as MailMessage,
-    MessageId, RemoteImagePolicy, ThreadId, ThreadSummary,
+    Attachment, BlobId, EmailAddress, KnownAddress, Mailbox, MailboxId, MailboxRole,
+    Message as MailMessage, MessageId, RemoteImagePolicy, ThreadId, ThreadSummary,
 };
 use vela_flows::{
-    InboxEffect, InboxEvent, InboxState, SearchInput, SearchQuery, ThreadFilter, TriageAction, html,
+    InboxEffect, InboxEvent, InboxState, SearchInput, SearchQuery, Suggestion, ThreadFilter,
+    TriageAction, html,
 };
 use vela_jmap::{
     ChangesCheck, JmapConfig, JmapCredentials, JmapSession, SyncStates, ThreadMutation, store,
@@ -231,6 +232,9 @@ struct App {
     core: Core,
     screen: Screen,
     inbox: InboxState,
+    /// Completions for the token being typed in the search bar.
+    search_suggestions: Vec<Suggestion>,
+    search_highlight: Option<usize>,
     session: Option<Arc<JmapSession>>,
     cache: Option<Arc<VelaCache>>,
     session_gen: u64,
@@ -326,6 +330,9 @@ enum Message {
     SearchEditBlock(usize),
     SearchRemoveBlock(usize),
     SearchRemoveLastBlock,
+    SearchAcceptSuggestion(usize),
+    SearchHighlightSuggestion(Option<usize>),
+    SearchDismissSuggestions,
     /// Toggle a `key:value` search operator from a quick filter chip.
     ToggleSearchOperator(&'static str, &'static str),
     SetFilter(ThreadFilter),
@@ -566,7 +573,10 @@ impl App {
     /// Parse the search bar contents and look up its free-text terms in the
     /// SQLCipher FTS5 index; structured operators are matched in memory.
     fn apply_search(&mut self, input: SearchInput) -> Task<Message> {
-        let query = SearchQuery::from_input(input, &Zoned::now());
+        let now = Zoned::now();
+        self.search_suggestions = input.suggestions(&self.address_book(), &now);
+        self.search_highlight = None;
+        let query = SearchQuery::from_input(input, &now);
         let fts_matches = if query.has_text() {
             self.cache
                 .as_ref()
@@ -576,6 +586,28 @@ impl App {
             None
         };
         self.dispatch(InboxEvent::SetSearchQuery { query, fts_matches })
+    }
+
+    /// Correspondents for `from:`/`to:` suggestions: the account's cached
+    /// threads, or the bundled sample threads in sample mode (no cache).
+    fn address_book(&self) -> Vec<KnownAddress> {
+        match &self.cache {
+            Some(cache) => match cache.known_addresses() {
+                Ok(book) => book,
+                Err(err) => {
+                    tracing::warn!(error = %err, "failed to load known addresses for search");
+                    Vec::new()
+                }
+            },
+            None => {
+                let threads = sample::threads_for_mailbox(&MailboxId("inbox".into()));
+                KnownAddress::tally(
+                    threads
+                        .iter()
+                        .map(|t| (t.senders.as_slice(), t.recipients.as_slice())),
+                )
+            }
+        }
     }
 
     fn dispatch(&mut self, event: InboxEvent) -> Task<Message> {
@@ -794,6 +826,8 @@ impl cosmic::Application for App {
             core,
             screen: Screen::Starting,
             inbox: InboxState::new(),
+            search_suggestions: Vec::new(),
+            search_highlight: None,
             session: None,
             cache: None,
             session_gen: 1,
@@ -1430,12 +1464,35 @@ impl cosmic::Application for App {
                 let input = self.inbox.search.input().without_last_block();
                 self.apply_search(input)
             }
+            Message::SearchAcceptSuggestion(index) => {
+                let Some(suggestion) = self.search_suggestions.get(index).cloned() else {
+                    return Task::none();
+                };
+                let input = self.inbox.search.input().accepting(&suggestion);
+                Task::batch([
+                    self.apply_search(input),
+                    widget::text_input::focus(search_input_id()),
+                ])
+            }
+            Message::SearchHighlightSuggestion(index) => {
+                self.search_highlight = index;
+                Task::none()
+            }
+            Message::SearchDismissSuggestions => {
+                self.search_suggestions.clear();
+                self.search_highlight = None;
+                Task::none()
+            }
             Message::ToggleSearchOperator(key, value) => {
                 let input = self.inbox.search.input().toggled_operator(key, value);
                 self.apply_search(input)
             }
             Message::SetFilter(filter) => self.dispatch(InboxEvent::SetFilter(filter)),
-            Message::ClearFilters => self.dispatch(InboxEvent::ClearFilters),
+            Message::ClearFilters => {
+                self.search_suggestions.clear();
+                self.search_highlight = None;
+                self.dispatch(InboxEvent::ClearFilters)
+            }
             Message::SyncNow => {
                 if self.syncing {
                     return Task::none();
@@ -2343,6 +2400,7 @@ impl App {
                     ("newer:7d  2w  3m  1y", "Received within"),
                     ("Space  /  Enter", "Turn typed operators into blocks"),
                     ("Backspace", "Remove last block (empty field)"),
+                    ("↑ ↓  Tab", "Pick / accept a suggestion"),
                 ],
             ));
 
@@ -2785,7 +2843,21 @@ impl App {
             .on_edit_token(Message::SearchEditBlock)
             .on_remove_token(Message::SearchRemoveBlock)
             .on_remove_last(Message::SearchRemoveLastBlock)
-            .on_clear(Message::ClearFilters),
+            .on_clear(Message::ClearFilters)
+            .suggestions(
+                self.search_suggestions
+                    .iter()
+                    .map(|s| widgets::SuggestionItem {
+                        label: s.label.clone(),
+                        detail: s.detail.clone(),
+                    })
+                    .collect(),
+                self.search_highlight,
+                self.threads_width - 24.0,
+                Message::SearchAcceptSuggestion,
+                Message::SearchHighlightSuggestion,
+                Message::SearchDismissSuggestions,
+            ),
         )
         .padding([8, 12, 4, 12])
         .width(Length::Fill);
