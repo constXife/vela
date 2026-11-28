@@ -13,19 +13,20 @@
 //!   `mark_read`, `move_thread`), logged to an owner-only JSONL audit log.
 //!   Direct `send` and permanent `destroy` are intentionally never exposed.
 
+use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use jiff::Timestamp;
+use jiff::{Timestamp, Zoned};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use vela_cache::VelaCache;
 use vela_core::{Mailbox, MailboxId, MailboxRole, ThreadId, ThreadSummary};
-use vela_flows::html;
+use vela_flows::{SearchQuery, html};
 use vela_jmap::{JmapConfig, JmapSession, ThreadMutation, store};
 
 const MCP_PROTOCOL_VERSION: &str = "2025-03-26";
@@ -358,34 +359,39 @@ impl McpServer {
                     .unwrap_or(20)
                     .clamp(1, 50) as usize;
 
-                let mut fts_hits: Vec<ThreadId> = Vec::new();
-                if let Some(cache) = self.backend.cache.clone() {
-                    let q = query.to_string();
-                    fts_hits = tokio::task::spawn_blocking(move || cache.search_threads(&q, limit))
-                        .await
-                        .map_err(|e| e.to_string())?
-                        .unwrap_or_default();
+                let parsed = SearchQuery::parse(query, &Zoned::now());
+                if !parsed.has_text() && !parsed.has_filters() {
+                    return Err(format!(
+                        "query has no search terms or valid operators (ignored: {})",
+                        parsed.invalid.join(" ")
+                    ));
                 }
+
+                let mut fts_hits: Vec<ThreadId> = Vec::new();
+                if parsed.has_text()
+                    && let Some(cache) = self.backend.cache.clone()
+                {
+                    let terms = parsed.text.clone();
+                    fts_hits =
+                        tokio::task::spawn_blocking(move || cache.search_threads(&terms, limit))
+                            .await
+                            .map_err(|e| e.to_string())?
+                            .unwrap_or_default();
+                }
+                let fts_set: HashSet<ThreadId> = fts_hits.iter().cloned().collect();
 
                 let inbox_id = self.backend.resolve_mailbox_id(None, Some("inbox")).await?;
                 let threads = self.backend.list_threads(&inbox_id, 100).await?;
-                let q_lower = query.to_lowercase();
                 let mut matched: Vec<Value> = threads
                     .into_iter()
-                    .filter(|t| {
-                        fts_hits.contains(&t.id)
-                            || t.subject.to_lowercase().contains(&q_lower)
-                            || t.snippet.to_lowercase().contains(&q_lower)
-                            || t.senders.iter().any(|s| {
-                                s.display_name().to_lowercase().contains(&q_lower)
-                                    || s.email.to_lowercase().contains(&q_lower)
-                            })
-                    })
+                    .filter(|t| parsed.matches(t, Some(&fts_set)))
                     .take(limit)
                     .map(|t| summarize_thread(&t))
                     .collect();
 
-                if matched.is_empty() && !fts_hits.is_empty() {
+                // FTS hits outside the latest Inbox summaries carry no metadata,
+                // so they can only be returned when no structured filter applies.
+                if matched.is_empty() && !fts_hits.is_empty() && !parsed.has_filters() {
                     matched = fts_hits
                         .into_iter()
                         .take(limit)
@@ -395,6 +401,7 @@ impl McpServer {
 
                 Ok(json!({
                     "query": query,
+                    "ignored_operators": parsed.invalid,
                     "untrusted_content_notice": UNTRUSTED_CONTENT_NOTICE,
                     "count": matched.len(),
                     "threads": matched,
@@ -639,11 +646,14 @@ fn tool_definitions(mode: PermissionMode) -> Vec<Value> {
         }),
         json!({
             "name": "search_emails",
-            "description": "Search emails by keyword using the local encrypted SQLCipher FTS5 index and Inbox summaries.",
+            "description": "Search Inbox emails by keyword (local encrypted SQLCipher FTS5 index and Inbox summaries) with optional structured operators.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "query": { "type": "string", "description": "Search keywords." },
+                    "query": {
+                        "type": "string",
+                        "description": "Keywords plus optional operators: from:<text>, to:<text>, has:attachment, is:unread, is:read, is:flagged, after:YYYY-MM-DD (inclusive), before:YYYY-MM-DD (exclusive), newer:<N>d|w|m|y. Quote multi-word values: from:\"Alice Smith\"."
+                    },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 50, "default": 20 }
                 },
                 "required": ["query"],

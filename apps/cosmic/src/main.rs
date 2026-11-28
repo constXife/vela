@@ -27,7 +27,9 @@ use vela_core::{
     Attachment, BlobId, EmailAddress, Mailbox, MailboxId, MailboxRole, Message as MailMessage,
     MessageId, RemoteImagePolicy, ThreadId, ThreadSummary,
 };
-use vela_flows::{InboxEffect, InboxEvent, InboxState, ThreadFilter, TriageAction, html};
+use vela_flows::{
+    InboxEffect, InboxEvent, InboxState, SearchQuery, ThreadFilter, TriageAction, html,
+};
 use vela_jmap::{
     ChangesCheck, JmapConfig, JmapCredentials, JmapSession, SyncStates, ThreadMutation, store,
 };
@@ -319,6 +321,8 @@ enum Message {
     ToggleQuote(MessageId),
     FocusSearch,
     SearchChanged(String),
+    /// Toggle a `key:value` search operator from a quick filter chip.
+    ToggleSearchOperator(&'static str, &'static str),
     SetFilter(ThreadFilter),
     ClearFilters,
     SyncNow,
@@ -552,6 +556,21 @@ impl App {
                 );
             }
         }
+    }
+
+    /// Parse the search bar text and look up its free-text terms in the
+    /// SQLCipher FTS5 index; structured operators are matched in memory.
+    fn apply_search(&mut self, raw: &str) -> Task<Message> {
+        let query = SearchQuery::parse(raw, &Zoned::now());
+        let fts_matches = if query.has_text() {
+            self.cache
+                .as_ref()
+                .and_then(|c| c.search_threads(&query.text, 100).ok())
+                .map(|hits| hits.into_iter().collect::<HashSet<_>>())
+        } else {
+            None
+        };
+        self.dispatch(InboxEvent::SetSearchQuery { query, fts_matches })
     }
 
     fn dispatch(&mut self, event: InboxEvent) -> Task<Message> {
@@ -1383,16 +1402,10 @@ impl cosmic::Application for App {
             Message::AllowRemoteImages(id) => self.dispatch(InboxEvent::AllowRemoteImages(id)),
             Message::ToggleQuote(id) => self.dispatch(InboxEvent::ToggleQuote(id)),
             Message::FocusSearch => widget::text_input::focus(search_input_id()),
-            Message::SearchChanged(query) => {
-                let fts_matches = if query.trim().is_empty() {
-                    None
-                } else {
-                    self.cache
-                        .as_ref()
-                        .and_then(|c| c.search_threads(&query, 100).ok())
-                        .map(|hits| hits.into_iter().collect::<HashSet<_>>())
-                };
-                self.dispatch(InboxEvent::SetSearchQuery { query, fts_matches })
+            Message::SearchChanged(raw) => self.apply_search(&raw),
+            Message::ToggleSearchOperator(key, value) => {
+                let raw = self.inbox.search.toggled_operator(key, value);
+                self.apply_search(&raw)
             }
             Message::SetFilter(filter) => self.dispatch(InboxEvent::SetFilter(filter)),
             Message::ClearFilters => self.dispatch(InboxEvent::ClearFilters),
@@ -2257,7 +2270,7 @@ impl App {
     }
 
     fn view_shortcuts_dialog(&self) -> Element<'_, Message> {
-        let content = widget::column::with_capacity(6)
+        let content = widget::column::with_capacity(8)
             .spacing(12)
             .push(shortcut_section(
                 "Navigation",
@@ -2288,11 +2301,31 @@ impl App {
                     ("Esc", "Close dialog / clear filters"),
                     ("?", "Toggle this shortcuts overlay"),
                 ],
+            ))
+            .push(widget::divider::horizontal::light())
+            .push(shortcut_section(
+                "Search operators",
+                &[
+                    ("from:alice  to:bob", "Sender / recipient"),
+                    ("has:attachment", "With attachments"),
+                    ("is:unread  is:read  is:flagged", "Read state / flagged"),
+                    (
+                        "after:2026-01-31  before:…",
+                        "Received on/after, before date",
+                    ),
+                    ("newer:7d  2w  3m  1y", "Received within"),
+                ],
             ));
 
         widget::dialog()
             .title("Keyboard Shortcuts")
-            .control(content)
+            // Bounded + scrollable so the Close action stays on screen in short windows.
+            .control(
+                widget::container(widget::scrollable(
+                    widget::container(content).padding([0, 14, 0, 0]),
+                ))
+                .max_height(460.0),
+            )
             .primary_action(widget::button::suggested("Close").on_press(Message::CloseShortcuts))
             .into()
     }
@@ -2701,7 +2734,7 @@ impl App {
         .width(Length::Fill);
 
         let search_bar = widget::container(
-            widget::search_input("Search mail…  (/)", &self.inbox.search_query)
+            widget::search_input("Search mail…  (/)", self.inbox.search.raw())
                 .id(search_input_id())
                 .on_input(Message::SearchChanged)
                 .on_clear(Message::ClearFilters)
@@ -2709,6 +2742,36 @@ impl App {
         )
         .padding([8, 12, 4, 12])
         .width(Length::Fill);
+
+        let search_chip = |label: &'static str, key: &'static str, value: &'static str| {
+            widget::button::custom(widget::text::caption(label))
+                .class(cosmic::theme::Button::ListItem([6.0; 4]))
+                .selected(self.inbox.search.has_operator(key, value))
+                .padding([3, 8])
+                .on_press(Message::ToggleSearchOperator(key, value))
+        };
+        let chips_row = widget::row::with_capacity(3)
+            .spacing(4)
+            .align_y(Alignment::Center)
+            .push(search_chip("Attachments", "has", "attachment"))
+            .push(search_chip("Last 7 days", "newer", "7d"))
+            .push(search_chip("Last 30 days", "newer", "30d"));
+        let mut chips_col = widget::column::with_capacity(2).spacing(2).push(chips_row);
+        if !self.inbox.search.invalid.is_empty() {
+            chips_col = chips_col.push(
+                widget::container(
+                    widget::text::caption(format!(
+                        "Ignored: {}",
+                        self.inbox.search.invalid.join(" ")
+                    ))
+                    .class(cosmic::theme::Text::Custom(muted_text_style)),
+                )
+                .padding([0, 8]),
+            );
+        }
+        let search_chips = widget::container(chips_col)
+            .padding([0, 12, 4, 12])
+            .width(Length::Fill);
 
         let now = Zoned::now();
         let visible_threads = self.inbox.visible_threads();
@@ -2733,8 +2796,8 @@ impl App {
                 .padding(12),
             );
         } else if visible_threads.is_empty() {
-            let empty_msg = if !self.inbox.search_query.trim().is_empty() {
-                format!("No matches for «{}».", self.inbox.search_query.trim())
+            let empty_msg = if !self.inbox.search.is_empty() {
+                format!("No matches for «{}».", self.inbox.search.raw().trim())
             } else if self.inbox.filter == ThreadFilter::Flagged {
                 "No flagged conversations.".to_string()
             } else {
@@ -2930,10 +2993,11 @@ impl App {
             }
         }
 
-        widget::column::with_capacity(4)
+        widget::column::with_capacity(5)
             .push(header)
             .push(widget::divider::horizontal::default())
             .push(search_bar)
+            .push(search_chips)
             .push(widget::scrollable(list).height(Length::Fill))
             .width(Length::Fixed(self.threads_width))
             .height(Length::Fill)

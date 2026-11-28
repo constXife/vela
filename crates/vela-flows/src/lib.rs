@@ -8,12 +8,15 @@
 //! instantaneous.
 
 pub mod html;
+pub mod search;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use vela_core::{
     Mailbox, MailboxId, MailboxRole, Message, MessageId, RemoteImagePolicy, ThreadId, ThreadSummary,
 };
+
+pub use search::SearchQuery;
 
 const CONVERSATION_CACHE_LIMIT: usize = 128;
 const INITIAL_PREFETCH_COUNT: usize = 4;
@@ -61,7 +64,7 @@ pub struct InboxState {
     pub last_undo: Option<UndoEntry>,
     pub status_banner: Option<String>,
     pub filter: ThreadFilter,
-    pub search_query: String,
+    pub search: SearchQuery,
     pub fts_matches: Option<HashSet<ThreadId>>,
     conversation_cache: HashMap<ThreadId, Vec<Message>>,
     conversation_cache_order: VecDeque<ThreadId>,
@@ -105,7 +108,7 @@ pub enum InboxEvent {
     ToggleQuote(MessageId),
     SetFilter(ThreadFilter),
     SetSearchQuery {
-        query: String,
+        query: SearchQuery,
         fts_matches: Option<HashSet<ThreadId>>,
     },
     ClearFilters,
@@ -160,7 +163,7 @@ impl InboxState {
     }
 
     pub fn has_active_filter(&self) -> bool {
-        self.filter != ThreadFilter::All || !self.search_query.trim().is_empty()
+        self.filter != ThreadFilter::All || !self.search.is_empty()
     }
 
     /// Evict specific threads from the in-memory conversation cache when JMAP
@@ -178,42 +181,18 @@ impl InboxState {
         }
     }
 
-    /// Threads matching the current `All`/`Unread` filter and search query
-    /// (combining live substring matching with SQLCipher FTS5 full-body hits).
+    /// Threads matching the current `All`/`Unread`/`Flagged` filter and the
+    /// structured search query (free text also matches SQLCipher FTS5 hits).
     pub fn visible_threads(&self) -> Vec<&ThreadSummary> {
-        let query = self.search_query.trim().to_lowercase();
         self.threads
             .iter()
             .filter(|thread| {
-                match self.filter {
-                    ThreadFilter::All => {}
-                    ThreadFilter::Unread => {
-                        if !thread.unread {
-                            return false;
-                        }
-                    }
-                    ThreadFilter::Flagged => {
-                        if !thread.flagged {
-                            return false;
-                        }
-                    }
-                }
-                if query.is_empty() {
-                    return true;
-                }
-                if self
-                    .fts_matches
-                    .as_ref()
-                    .is_some_and(|hits| hits.contains(&thread.id))
-                {
-                    return true;
-                }
-                thread.subject.to_lowercase().contains(&query)
-                    || thread.snippet.to_lowercase().contains(&query)
-                    || thread.senders.iter().any(|s| {
-                        s.display_name().to_lowercase().contains(&query)
-                            || s.email.to_lowercase().contains(&query)
-                    })
+                let passes_filter = match self.filter {
+                    ThreadFilter::All => true,
+                    ThreadFilter::Unread => thread.unread,
+                    ThreadFilter::Flagged => thread.flagged,
+                };
+                passes_filter && self.search.matches(thread, self.fts_matches.as_ref())
             })
             .collect()
     }
@@ -403,13 +382,13 @@ impl InboxState {
                 self.ensure_selection_visible()
             }
             InboxEvent::SetSearchQuery { query, fts_matches } => {
-                self.search_query = query;
+                self.search = query;
                 self.fts_matches = fts_matches;
                 self.ensure_selection_visible()
             }
             InboxEvent::ClearFilters => {
                 self.filter = ThreadFilter::All;
-                self.search_query.clear();
+                self.search = SearchQuery::default();
                 self.fts_matches = None;
                 self.ensure_selection_visible()
             }
@@ -953,7 +932,7 @@ mod tests {
         let mut fts = HashSet::new();
         fts.insert(ThreadId("t-3".into()));
         state.handle(InboxEvent::SetSearchQuery {
-            query: "rust".into(),
+            query: SearchQuery::parse("rust", &jiff::Zoned::now()),
             fts_matches: Some(fts),
         });
         let visible: Vec<&str> = state

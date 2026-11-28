@@ -505,18 +505,26 @@ impl VelaCache {
     }
 
     /// Full-text search across cached threads and message bodies using FTS5.
-    pub fn search_threads(&self, query: &str, limit: usize) -> Result<Vec<ThreadId>, VelaError> {
-        let trimmed = query.trim();
-        if trimmed.is_empty() || limit == 0 {
-            return Ok(Vec::new());
-        }
-        // Quote tokens as prefix phrases so punctuation like `@` or `-` never
+    ///
+    /// Every term must match (implicit AND); each term is a prefix phrase, so a
+    /// multi-word term matches those words adjacently.
+    pub fn search_threads<S: AsRef<str>>(
+        &self,
+        terms: &[S],
+        limit: usize,
+    ) -> Result<Vec<ThreadId>, VelaError> {
+        // Quote terms as prefix phrases so punctuation like `@` or `-` never
         // causes FTS5 syntax errors.
-        let fts_query = trimmed
-            .split_whitespace()
-            .map(|tok| format!("\"{}\"*", tok.replace('"', "\"\"")))
+        let fts_query = terms
+            .iter()
+            .map(|term| term.as_ref().trim())
+            .filter(|term| !term.is_empty())
+            .map(|term| format!("\"{}\"*", term.replace('"', "\"\"")))
             .collect::<Vec<_>>()
             .join(" ");
+        if fts_query.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
 
         let conn = self.lock_conn()?;
         let mut stmt = conn
@@ -863,7 +871,7 @@ mod tests {
         assert_eq!(cache.load_conversation(&thread_id).unwrap(), Some(messages));
 
         // FTS5 search finds the thread.
-        let hits = cache.search_threads(secret_marker, 10).unwrap();
+        let hits = cache.search_threads(&[secret_marker], 10).unwrap();
         assert_eq!(hits, vec![thread_id.clone()]);
 
         // Selective invalidation removes only the invalidated thread's messages & FTS entry.
@@ -871,7 +879,12 @@ mod tests {
             .invalidate_threads(std::slice::from_ref(&thread_id))
             .unwrap();
         assert_eq!(cache.load_conversation(&thread_id).unwrap(), None);
-        assert!(cache.search_threads(secret_marker, 10).unwrap().is_empty());
+        assert!(
+            cache
+                .search_threads(&[secret_marker], 10)
+                .unwrap()
+                .is_empty()
+        );
 
         drop(cache);
 
@@ -906,6 +919,50 @@ mod tests {
         let mailbox_id = MailboxId("mb".into());
         rebuilt.save_threads(&mailbox_id, &[]).unwrap();
         assert!(rebuilt.load_threads(&mailbox_id).unwrap().is_empty());
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn search_terms_are_anded_and_blank_terms_ignored() {
+        let path = temp_db_path("search_terms");
+        let cache = VelaCache::open_at(path.clone(), KEY_A).unwrap();
+        let mailbox_id = MailboxId("mb".into());
+        let thread = |id: &str, subject: &str| ThreadSummary {
+            id: ThreadId(id.into()),
+            subject: subject.into(),
+            snippet: String::new(),
+            senders: vec![],
+            recipients: vec![],
+            received_at: Timestamp::UNIX_EPOCH,
+            message_count: 1,
+            unread: false,
+            flagged: false,
+            has_attachments: false,
+            mailbox_ids: vec![mailbox_id.clone()],
+        };
+        cache
+            .save_threads(
+                &mailbox_id,
+                &[
+                    thread("t-1", "Quarterly invoice report"),
+                    thread("t-2", "Invoice reminder"),
+                ],
+            )
+            .unwrap();
+
+        let mut hits = cache.search_threads(&["invoice"], 10).unwrap();
+        hits.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(hits, vec![ThreadId("t-1".into()), ThreadId("t-2".into())]);
+        assert_eq!(
+            cache.search_threads(&["invo", "quarter"], 10).unwrap(),
+            vec![ThreadId("t-1".into())]
+        );
+        assert_eq!(
+            cache.search_threads(&["invoice report"], 10).unwrap(),
+            vec![ThreadId("t-1".into())]
+        );
+        assert!(cache.search_threads(&[" ", ""], 10).unwrap().is_empty());
 
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }

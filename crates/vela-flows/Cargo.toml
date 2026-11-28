@@ -7,7 +7,6 @@ publish.workspace = true
 
 [dependencies]
 ammonia.workspace = true
+jiff.workspace = true
 vela-core.workspace = true
 
-[dev-dependencies]
-jiff.workspace = true
