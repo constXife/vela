@@ -94,7 +94,47 @@ pub fn sanitize_html(html: &str, policy: RemoteImagePolicy) -> String {
         });
     }
 
-    builder.clean(html).to_string()
+    builder.clean(&plaintext_as_pre(html)).to_string()
+}
+
+/// Rewrite the obsolete `<plaintext>` element as `<pre>`.
+///
+/// HTML5 tokenizes everything after `<plaintext>` as raw text, so the
+/// document's own closing tags (`</plaintext></body></html>`) would otherwise
+/// leak into the visible body. `<pre>` keeps the preformatted intent while the
+/// rest of the markup stays markup.
+fn plaintext_as_pre(html: &str) -> Cow<'_, str> {
+    const NAME: &str = "plaintext";
+    let lower = html.to_ascii_lowercase();
+    if !lower.contains(NAME) {
+        return Cow::Borrowed(html);
+    }
+
+    let mut out = String::with_capacity(html.len());
+    let mut copied = 0;
+    let mut cursor = 0;
+    while let Some(pos) = lower[cursor..].find('<') {
+        let open = cursor + pos;
+        let name_start = if lower[open + 1..].starts_with('/') {
+            open + 2
+        } else {
+            open + 1
+        };
+        let name_end = name_start + NAME.len();
+        let is_plaintext_tag = lower[name_start..].starts_with(NAME)
+            && lower[name_end..]
+                .chars()
+                .next()
+                .is_none_or(|c| c == '>' || c == '/' || c.is_ascii_whitespace());
+        if is_plaintext_tag {
+            out.push_str(&html[copied..name_start]);
+            out.push_str("pre");
+            copied = name_end;
+        }
+        cursor = open + 1;
+    }
+    out.push_str(&html[copied..]);
+    Cow::Owned(out)
 }
 
 /// Prepare a message body for clean display in the conversation pane.
@@ -179,7 +219,6 @@ fn looks_like_html(input: &str) -> bool {
         "<span",
         "<p>",
         "<p ",
-        "</p>",
         "<br",
         "<a ",
         "<img",
@@ -187,7 +226,16 @@ fn looks_like_html(input: &str) -> bool {
         "<tr",
         "<td",
     ];
-    MARKERS.iter().any(|m| lower.contains(m))
+    MARKERS.iter().any(|m| lower.contains(m)) || has_closing_tag(&lower)
+}
+
+/// Any `</name` sequence, including one cut off by preview truncation
+/// (`</plaint`). Plain text practically never contains `</` before a letter,
+/// unlike `<user@host>` or `Vec<String>` which must stay untouched.
+fn has_closing_tag(input: &str) -> bool {
+    input
+        .match_indices("</")
+        .any(|(pos, _)| input[pos + 2..].starts_with(|c: char| c.is_ascii_alphabetic()))
 }
 
 /// Convert sanitized HTML into clean readable plain text while preserving
@@ -419,6 +467,51 @@ mod tests {
         assert_eq!(
             prepared.main_text,
             "Full delivery report succeeded for domain example.com."
+        );
+    }
+
+    #[test]
+    fn clean_snippet_drops_truncated_closing_tag() {
+        assert_eq!(clean_snippet("</plaint", 90), "");
+        assert_eq!(
+            clean_snippet("Email Delivery Report for example.com </plaint", 90),
+            "Email Delivery Report for example.com"
+        );
+    }
+
+    #[test]
+    fn clean_snippet_keeps_angle_brackets_in_plain_text() {
+        assert_eq!(
+            clean_snippet("Reply from <ops@example.com>: Vec<String> & 1 </ 2", 90),
+            "Reply from <ops@example.com>: Vec<String> & 1 </ 2"
+        );
+    }
+
+    #[test]
+    fn prepare_body_prefers_html_when_text_body_is_a_stray_tag() {
+        let prepared = prepare_body(
+            Some("</plaint"),
+            Some(
+                "<html><body><h1>Email Delivery Report</h1><p>All messages to example.com were delivered.</p></body></html>",
+            ),
+        );
+        assert_eq!(
+            prepared.main_text,
+            "Email Delivery Report\nAll messages to example.com were delivered."
+        );
+    }
+
+    #[test]
+    fn plaintext_element_does_not_leak_closing_tags() {
+        let html = "<html><body><p>Email Delivery Report</p><PLAINTEXT>Delivered: 12\nFailed: 0</plaintext></body></html>";
+        let text = html_to_readable_text(html);
+        assert_eq!(text, "Email Delivery Report\nDelivered: 12\nFailed: 0");
+
+        let prepared = prepare_body(Some("</plaint"), Some(html));
+        assert_eq!(prepared.main_text, text);
+        assert_eq!(
+            clean_snippet(html, 90),
+            "Email Delivery Report Delivered: 12 Failed: 0"
         );
     }
 }
