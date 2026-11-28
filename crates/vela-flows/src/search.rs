@@ -2,10 +2,12 @@
 
 //! Structured search query parsing for the thread list search bar.
 //!
-//! The raw search text is the single source of truth: operators such as
-//! `from:`, `has:attachment`, `is:unread` or `newer:7d` are parsed into
-//! structured filters, and every remaining term is free text that is matched
-//! against thread summaries and the SQLCipher FTS5 index.
+//! [`SearchInput`] is the single source of truth for what the user typed:
+//! committed operator blocks plus the draft text still being edited. It is
+//! parsed into a [`SearchQuery`]: operators such as `from:`, `has:attachment`,
+//! `is:unread` or `newer:7d` become structured filters, and every remaining
+//! term is free text matched against thread summaries and the SQLCipher FTS5
+//! index.
 //!
 //! Supported operators (case-insensitive keys):
 //! - `from:<text>` / `to:<text>` — substring of a sender / recipient name or address
@@ -25,10 +27,159 @@ use jiff::civil::Date;
 use jiff::{Span, Timestamp, Zoned};
 use vela_core::{EmailAddress, ThreadId, ThreadSummary};
 
+/// Operator keys; any other `key:value` token is free text.
+const OPERATOR_KEYS: [&str; 7] = ["from", "to", "has", "is", "after", "before", "newer"];
+
+/// Search bar contents: committed operator blocks and the draft being typed.
+///
+/// An operator token moves from the draft into a block once it is finished
+/// (followed by whitespace, or on submit). Blocks are kept verbatim, so
+/// invalid operators stay visible and editable instead of being dropped.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SearchInput {
+    blocks: Vec<String>,
+    draft: String,
+}
+
+impl SearchInput {
+    /// Everything in `raw` as draft text, without committing blocks.
+    pub fn from_raw(raw: &str) -> Self {
+        Self {
+            blocks: Vec::new(),
+            draft: raw.to_string(),
+        }
+    }
+
+    pub fn blocks(&self) -> &[String] {
+        &self.blocks
+    }
+
+    pub fn draft(&self) -> &str {
+        &self.draft
+    }
+
+    /// Blocks followed by the draft, as one raw query string.
+    pub fn raw(&self) -> String {
+        self.blocks
+            .iter()
+            .map(String::as_str)
+            .chain(std::iter::once(self.draft.trim()))
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.blocks.is_empty() && self.draft.trim().is_empty()
+    }
+
+    /// Replace the draft; an operator token just finished with whitespace
+    /// becomes a block.
+    pub fn with_draft(&self, draft: &str) -> Self {
+        let mut next = Self {
+            blocks: self.blocks.clone(),
+            draft: draft.to_string(),
+        };
+        if !draft.ends_with(char::is_whitespace) || !quotes_balanced(draft) {
+            return next;
+        }
+        let mut tokens = tokenize(draft);
+        if tokens.last().is_some_and(|tok| is_operator_token(tok)) {
+            next.blocks.extend(tokens.pop());
+            next.draft = join_draft(&tokens, true);
+        }
+        next
+    }
+
+    /// Commit every finished operator token in the draft (e.g. on Enter).
+    pub fn committed(&self) -> Self {
+        if !quotes_balanced(&self.draft) {
+            return self.clone();
+        }
+        let (operators, text): (Vec<String>, Vec<String>) = tokenize(&self.draft)
+            .into_iter()
+            .partition(|tok| is_operator_token(tok));
+        let mut blocks = self.blocks.clone();
+        blocks.extend(operators);
+        Self {
+            blocks,
+            draft: join_draft(&text, false),
+        }
+    }
+
+    pub fn without_block(&self, index: usize) -> Self {
+        let mut next = self.clone();
+        if index < next.blocks.len() {
+            next.blocks.remove(index);
+        }
+        next
+    }
+
+    pub fn without_last_block(&self) -> Self {
+        let mut next = self.clone();
+        next.blocks.pop();
+        next
+    }
+
+    /// Move block `index` back to the end of the draft for editing.
+    pub fn editing_block(&self, index: usize) -> Self {
+        let mut next = self.clone();
+        if index >= next.blocks.len() {
+            return next;
+        }
+        let block = next.blocks.remove(index);
+        let draft = next.draft.trim_end();
+        next.draft = if draft.is_empty() {
+            block
+        } else {
+            format!("{draft} {block}")
+        };
+        next
+    }
+
+    /// Whether `key:value` is present as a block or a draft token.
+    pub fn has_operator(&self, key: &str, value: &str) -> bool {
+        self.blocks
+            .iter()
+            .cloned()
+            .chain(tokenize(&self.draft))
+            .any(|tok| {
+                split_operator(&tok).is_some_and(|(k, v)| {
+                    k.eq_ignore_ascii_case(key) && unquote(v).eq_ignore_ascii_case(value)
+                })
+            })
+    }
+
+    /// Toggle `key:value`: if present, every `key:*` block and draft token is
+    /// removed; otherwise they are replaced by a `key:value` block.
+    pub fn toggled_operator(&self, key: &str, value: &str) -> Self {
+        let was_set = self.has_operator(key, value);
+        let has_key =
+            |tok: &String| split_operator(tok).is_some_and(|(k, _)| k.eq_ignore_ascii_case(key));
+        let mut blocks: Vec<String> = self
+            .blocks
+            .iter()
+            .filter(|t| !has_key(t))
+            .cloned()
+            .collect();
+        let draft_tokens: Vec<String> = tokenize(&self.draft)
+            .into_iter()
+            .filter(|t| !has_key(t))
+            .collect();
+        if !was_set {
+            blocks.push(format!("{key}:{value}"));
+        }
+        Self {
+            blocks,
+            draft: join_draft(&draft_tokens, self.draft.ends_with(char::is_whitespace)),
+        }
+    }
+}
+
 /// Parsed search bar contents.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SearchQuery {
-    raw: String,
+    input: SearchInput,
     /// Free-text terms (quoted phrases kept as one term).
     pub text: Vec<String>,
     /// Lowercased `from:` needles; all must match a sender.
@@ -48,25 +199,29 @@ pub struct SearchQuery {
 }
 
 impl SearchQuery {
-    /// Parse `raw`, resolving calendar dates and relative ages against `now`.
+    /// Parse raw query text, resolving calendar dates and relative ages
+    /// against `now`.
     pub fn parse(raw: &str, now: &Zoned) -> Self {
-        let mut query = Self {
-            raw: raw.to_string(),
-            ..Self::default()
-        };
-        for token in tokenize(raw) {
+        Self::from_input(SearchInput::from_raw(raw), now)
+    }
+
+    /// Parse search bar contents, resolving dates against `now`.
+    pub fn from_input(input: SearchInput, now: &Zoned) -> Self {
+        let mut query = Self::default();
+        for token in tokenize(&input.raw()) {
             query.apply_token(&token, now);
         }
+        query.input = input;
         query
     }
 
-    /// The raw search text this query was parsed from.
-    pub fn raw(&self) -> &str {
-        &self.raw
+    /// The search bar contents this query was parsed from.
+    pub fn input(&self) -> &SearchInput {
+        &self.input
     }
 
     pub fn is_empty(&self) -> bool {
-        self.raw.trim().is_empty()
+        self.input.is_empty()
     }
 
     pub fn has_text(&self) -> bool {
@@ -82,29 +237,6 @@ impl SearchQuery {
             || self.flagged
             || self.received_after.is_some()
             || self.received_before.is_some()
-    }
-
-    /// Whether the raw text contains `key:value` as a standalone token.
-    pub fn has_operator(&self, key: &str, value: &str) -> bool {
-        tokenize(&self.raw).iter().any(|tok| {
-            split_operator(tok).is_some_and(|(k, v)| {
-                k.eq_ignore_ascii_case(key) && unquote(v).eq_ignore_ascii_case(value)
-            })
-        })
-    }
-
-    /// Raw text with `key:value` toggled: if present, every `key:*` token is
-    /// removed; otherwise any other `key:*` token is replaced by `key:value`.
-    pub fn toggled_operator(&self, key: &str, value: &str) -> String {
-        let was_set = self.has_operator(key, value);
-        let mut tokens: Vec<String> = tokenize(&self.raw)
-            .into_iter()
-            .filter(|tok| !split_operator(tok).is_some_and(|(k, _)| k.eq_ignore_ascii_case(key)))
-            .collect();
-        if !was_set {
-            tokens.push(format!("{key}:{value}"));
-        }
-        tokens.join(" ")
     }
 
     /// Whether `thread` satisfies every structured filter and every free-text
@@ -158,7 +290,7 @@ impl SearchQuery {
     }
 
     fn apply_token(&mut self, token: &str, now: &Zoned) {
-        let Some((key, value)) = split_operator(token) else {
+        let Some((key, value)) = split_operator(token).filter(|_| is_operator_token(token)) else {
             self.push_text(token);
             return;
         };
@@ -203,11 +335,7 @@ impl SearchQuery {
                 }
                 None => false,
             },
-            "has" | "is" => false,
-            _ => {
-                self.push_text(token);
-                return;
-            }
+            _ => false,
         };
         if !valid {
             self.invalid.push(token.to_string());
@@ -266,6 +394,26 @@ fn relative_age_start(value: &str, now: &Zoned) -> Option<Timestamp> {
         _ => return None,
     };
     now.checked_sub(span).ok().map(|z| z.timestamp())
+}
+
+fn is_operator_token(token: &str) -> bool {
+    split_operator(token).is_some_and(|(key, _)| {
+        OPERATOR_KEYS
+            .iter()
+            .any(|known| known.eq_ignore_ascii_case(key))
+    })
+}
+
+fn quotes_balanced(text: &str) -> bool {
+    text.matches('"').count().is_multiple_of(2)
+}
+
+fn join_draft(tokens: &[String], trailing_space: bool) -> String {
+    let mut draft = tokens.join(" ");
+    if trailing_space && !draft.is_empty() {
+        draft.push(' ');
+    }
+    draft
 }
 
 /// Split `key:value` where `key` is a non-empty ASCII word.
@@ -433,20 +581,64 @@ mod tests {
     }
 
     #[test]
-    fn toggles_chip_operators_in_raw_text() {
-        let q = SearchQuery::parse("invoice newer:30d", &now());
-        assert!(q.has_operator("newer", "30d"));
-        assert!(!q.has_operator("newer", "7d"));
+    fn finished_operators_become_blocks() {
+        let input = SearchInput::default().with_draft("invoice from:ali");
+        assert!(input.blocks().is_empty());
 
-        // Selecting another preset replaces the existing one.
-        assert_eq!(q.toggled_operator("newer", "7d"), "invoice newer:7d");
-        // Toggling the active preset removes it.
-        assert_eq!(q.toggled_operator("newer", "30d"), "invoice");
+        // Whitespace after an operator commits it; free text stays in the draft.
+        let input = input.with_draft("invoice from:alice ");
+        assert_eq!(input.blocks(), ["from:alice"]);
+        assert_eq!(input.draft(), "invoice ");
 
-        let q = SearchQuery::parse(r#"from:"Alice Smith""#, &now());
+        // Unknown keys are text; open quotes keep the token in the draft.
+        let input = input.with_draft("invoice https://x.test ");
+        assert_eq!(input.blocks(), ["from:alice"]);
+        let input = input.with_draft(r#"invoice to:"Bob "#);
+        assert_eq!(input.draft(), r#"invoice to:"Bob "#);
+        let input = input.with_draft(r#"invoice to:"Bob Lee" "#);
+        assert_eq!(input.blocks(), ["from:alice", r#"to:"Bob Lee""#]);
+
+        // Invalid operators become blocks too, so they stay visible.
+        let input = input.with_draft("invoice after:2026-13-01 ");
+        assert_eq!(input.blocks().last().unwrap(), "after:2026-13-01");
         assert_eq!(
-            q.toggled_operator("has", "attachment"),
-            r#"from:"Alice Smith" has:attachment"#
+            input.raw(),
+            r#"from:alice to:"Bob Lee" after:2026-13-01 invoice"#
         );
+        let q = SearchQuery::from_input(input, &now());
+        assert_eq!(q.invalid, vec!["after:2026-13-01"]);
+        assert_eq!(q.text, vec!["invoice"]);
+    }
+
+    #[test]
+    fn submit_edit_and_remove_blocks() {
+        let input = SearchInput::default().with_draft("is:unread q3 has:attachment");
+        let input = input.committed();
+        assert_eq!(input.blocks(), ["is:unread", "has:attachment"]);
+        assert_eq!(input.draft(), "q3");
+
+        let edited = input.editing_block(0);
+        assert_eq!(edited.blocks(), ["has:attachment"]);
+        assert_eq!(edited.draft(), "q3 is:unread");
+
+        assert_eq!(input.without_block(1).blocks(), ["is:unread"]);
+        assert_eq!(input.without_last_block().blocks(), ["is:unread"]);
+        assert_eq!(input.without_block(9), input);
+    }
+
+    #[test]
+    fn toggles_chip_operators() {
+        let input = SearchInput::default().with_draft("newer:30d invoice");
+        assert!(input.has_operator("newer", "30d"));
+        assert!(!input.has_operator("newer", "7d"));
+
+        // Selecting another preset replaces the existing one (even in the draft).
+        let seven = input.toggled_operator("newer", "7d");
+        assert_eq!(seven.blocks(), ["newer:7d"]);
+        assert_eq!(seven.draft(), "invoice");
+        // Toggling the active preset removes it.
+        let off = seven.toggled_operator("newer", "7d");
+        assert!(off.blocks().is_empty());
+        assert_eq!(off.raw(), "invoice");
     }
 }

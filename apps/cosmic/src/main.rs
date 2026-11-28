@@ -8,6 +8,7 @@
 //! non-secret account metadata in `~/.config/vela/config.toml` (`0600`).
 
 mod sample;
+mod widgets;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -28,7 +29,7 @@ use vela_core::{
     MessageId, RemoteImagePolicy, ThreadId, ThreadSummary,
 };
 use vela_flows::{
-    InboxEffect, InboxEvent, InboxState, SearchQuery, ThreadFilter, TriageAction, html,
+    InboxEffect, InboxEvent, InboxState, SearchInput, SearchQuery, ThreadFilter, TriageAction, html,
 };
 use vela_jmap::{
     ChangesCheck, JmapConfig, JmapCredentials, JmapSession, SyncStates, ThreadMutation, store,
@@ -320,7 +321,11 @@ enum Message {
     AllowRemoteImages(MessageId),
     ToggleQuote(MessageId),
     FocusSearch,
-    SearchChanged(String),
+    SearchDraftChanged(String),
+    SearchSubmitted,
+    SearchEditBlock(usize),
+    SearchRemoveBlock(usize),
+    SearchRemoveLastBlock,
     /// Toggle a `key:value` search operator from a quick filter chip.
     ToggleSearchOperator(&'static str, &'static str),
     SetFilter(ThreadFilter),
@@ -558,10 +563,10 @@ impl App {
         }
     }
 
-    /// Parse the search bar text and look up its free-text terms in the
+    /// Parse the search bar contents and look up its free-text terms in the
     /// SQLCipher FTS5 index; structured operators are matched in memory.
-    fn apply_search(&mut self, raw: &str) -> Task<Message> {
-        let query = SearchQuery::parse(raw, &Zoned::now());
+    fn apply_search(&mut self, input: SearchInput) -> Task<Message> {
+        let query = SearchQuery::from_input(input, &Zoned::now());
         let fts_matches = if query.has_text() {
             self.cache
                 .as_ref()
@@ -1402,10 +1407,32 @@ impl cosmic::Application for App {
             Message::AllowRemoteImages(id) => self.dispatch(InboxEvent::AllowRemoteImages(id)),
             Message::ToggleQuote(id) => self.dispatch(InboxEvent::ToggleQuote(id)),
             Message::FocusSearch => widget::text_input::focus(search_input_id()),
-            Message::SearchChanged(raw) => self.apply_search(&raw),
+            Message::SearchDraftChanged(draft) => {
+                let input = self.inbox.search.input().with_draft(&draft);
+                self.apply_search(input)
+            }
+            Message::SearchSubmitted => {
+                let input = self.inbox.search.input().committed();
+                self.apply_search(input)
+            }
+            Message::SearchEditBlock(index) => {
+                let input = self.inbox.search.input().editing_block(index);
+                Task::batch([
+                    self.apply_search(input),
+                    widget::text_input::focus(search_input_id()),
+                ])
+            }
+            Message::SearchRemoveBlock(index) => {
+                let input = self.inbox.search.input().without_block(index);
+                self.apply_search(input)
+            }
+            Message::SearchRemoveLastBlock => {
+                let input = self.inbox.search.input().without_last_block();
+                self.apply_search(input)
+            }
             Message::ToggleSearchOperator(key, value) => {
-                let raw = self.inbox.search.toggled_operator(key, value);
-                self.apply_search(&raw)
+                let input = self.inbox.search.input().toggled_operator(key, value);
+                self.apply_search(input)
             }
             Message::SetFilter(filter) => self.dispatch(InboxEvent::SetFilter(filter)),
             Message::ClearFilters => self.dispatch(InboxEvent::ClearFilters),
@@ -2314,6 +2341,8 @@ impl App {
                         "Received on/after, before date",
                     ),
                     ("newer:7d  2w  3m  1y", "Received within"),
+                    ("Space  /  Enter", "Turn typed operators into blocks"),
+                    ("Backspace", "Remove last block (empty field)"),
                 ],
             ));
 
@@ -2733,12 +2762,30 @@ impl App {
         .height(Length::Fixed(52.0))
         .width(Length::Fill);
 
+        let search = &self.inbox.search;
+        let blocks = search
+            .input()
+            .blocks()
+            .iter()
+            .map(|block| widgets::Token {
+                label: block.clone(),
+                warning: search.invalid.contains(block),
+            })
+            .collect();
         let search_bar = widget::container(
-            widget::search_input("Search mail…  (/)", self.inbox.search.raw())
-                .id(search_input_id())
-                .on_input(Message::SearchChanged)
-                .on_clear(Message::ClearFilters)
-                .width(Length::Fill),
+            widgets::token_input(
+                search_input_id(),
+                "Search mail…  (/)",
+                search.input().draft(),
+                blocks,
+            )
+            .leading_icon("system-search-symbolic")
+            .on_input(Message::SearchDraftChanged)
+            .on_submit(|_| Message::SearchSubmitted)
+            .on_edit_token(Message::SearchEditBlock)
+            .on_remove_token(Message::SearchRemoveBlock)
+            .on_remove_last(Message::SearchRemoveLastBlock)
+            .on_clear(Message::ClearFilters),
         )
         .padding([8, 12, 4, 12])
         .width(Length::Fill);
@@ -2746,7 +2793,7 @@ impl App {
         let search_chip = |label: &'static str, key: &'static str, value: &'static str| {
             widget::button::custom(widget::text::caption(label))
                 .class(cosmic::theme::Button::ListItem([6.0; 4]))
-                .selected(self.inbox.search.has_operator(key, value))
+                .selected(self.inbox.search.input().has_operator(key, value))
                 .padding([3, 8])
                 .on_press(Message::ToggleSearchOperator(key, value))
         };
@@ -2756,20 +2803,7 @@ impl App {
             .push(search_chip("Attachments", "has", "attachment"))
             .push(search_chip("Last 7 days", "newer", "7d"))
             .push(search_chip("Last 30 days", "newer", "30d"));
-        let mut chips_col = widget::column::with_capacity(2).spacing(2).push(chips_row);
-        if !self.inbox.search.invalid.is_empty() {
-            chips_col = chips_col.push(
-                widget::container(
-                    widget::text::caption(format!(
-                        "Ignored: {}",
-                        self.inbox.search.invalid.join(" ")
-                    ))
-                    .class(cosmic::theme::Text::Custom(muted_text_style)),
-                )
-                .padding([0, 8]),
-            );
-        }
-        let search_chips = widget::container(chips_col)
+        let search_chips = widget::container(chips_row)
             .padding([0, 12, 4, 12])
             .width(Length::Fill);
 
@@ -2797,7 +2831,7 @@ impl App {
             );
         } else if visible_threads.is_empty() {
             let empty_msg = if !self.inbox.search.is_empty() {
-                format!("No matches for «{}».", self.inbox.search.raw().trim())
+                format!("No matches for «{}».", self.inbox.search.input().raw())
             } else if self.inbox.filter == ThreadFilter::Flagged {
                 "No flagged conversations.".to_string()
             } else {

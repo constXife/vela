@@ -16,7 +16,7 @@ use vela_core::{
     Mailbox, MailboxId, MailboxRole, Message, MessageId, RemoteImagePolicy, ThreadId, ThreadSummary,
 };
 
-pub use search::SearchQuery;
+pub use search::{SearchInput, SearchQuery};
 
 const CONVERSATION_CACHE_LIMIT: usize = 128;
 const INITIAL_PREFETCH_COUNT: usize = 4;
